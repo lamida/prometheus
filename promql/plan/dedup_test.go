@@ -11,23 +11,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package plan
+package plan_test
 
 import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/prometheus/prometheus/promql/plan"
 )
 
 // TestFromExpr_DeduplicateAndMergeInsertion covers the insertion side of
-// EliminateDeduplicateAndMerge: which BinaryExpr/Call/UnaryExpr nodes
-// FromExpr wraps in a DeduplicateAndMergeNode.
+// plan.EliminateDeduplicateAndMerge: which BinaryExpr/Call/UnaryExpr nodes
+// plan.FromExpr wraps in a plan.DeduplicateAndMergeNode.
 func TestFromExpr_DeduplicateAndMergeInsertion(t *testing.T) {
 	tests := []struct {
 		name      string
 		query     string
 		wantWrap  bool
-		checkRoot func(t *testing.T, root Node) Node // returns the (possibly unwrapped) inner node for further assertions.
+		checkRoot func(t *testing.T, root plan.Node) plan.Node // returns the (possibly unwrapped) inner node for further assertions.
 	}{
 		{
 			name:     "rate is wrapped",
@@ -99,10 +101,10 @@ func TestFromExpr_DeduplicateAndMergeInsertion(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			expr := preprocess(t, tc.query)
-			p, err := FromExpr(expr)
+			p, err := plan.FromExpr(expr)
 			require.NoError(t, err)
 
-			_, isDedup := p.Root.(*DeduplicateAndMergeNode)
+			_, isDedup := p.Root.(*plan.DeduplicateAndMergeNode)
 			require.Equal(t, tc.wantWrap, isDedup, "plan: %s", p.String())
 		})
 	}
@@ -146,7 +148,7 @@ func TestEliminateDeduplicateAndMerge(t *testing.T) {
 			// outer unary minus: not eliminable in non-delayed mode, since
 			// nothing proves the underlying selection is unique. In
 			// delayed mode it IS eliminated: canEliminateDeduplicateAndMergeDelayedNameRemoval
-			// defaults to true for UnaryExprNode (Mimir's own
+			// defaults to true for plan.UnaryExprNode (Mimir's own
 			// canEliminateDeduplicateAndMergeDelayedNameRemoval switch only
 			// special-cases BinaryExpression/DropName/FunctionCall; a bare
 			// UnaryExpression falls through to its default:true case),
@@ -173,9 +175,9 @@ func TestEliminateDeduplicateAndMerge(t *testing.T) {
 		{
 			// Arithmetic vector-scalar: not eliminated in non-delayed mode
 			// (canEliminateDeduplicateAndMerge always returns false for a
-			// non-retaining vector-scalar BinaryExprNode, regardless of the
+			// non-retaining vector-scalar plan.BinaryExprNode, regardless of the
 			// vector operand), but eliminated in delayed mode (only `or`
-			// disqualifies a BinaryExprNode there).
+			// disqualifies a plan.BinaryExprNode there).
 			name:                   "arithmetic vector-scalar differs by mode",
 			query:                  "rate(foo[5m]) + 5",
 			wantEliminatedNonDelay: false,
@@ -194,27 +196,27 @@ func TestEliminateDeduplicateAndMerge(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			// EliminateDeduplicateAndMerge mutates its input tree in place
+			// plan.EliminateDeduplicateAndMerge mutates its input tree in place
 			// (via ReplaceChild), so each mode needs its own freshly-built
-			// plan rather than sharing one FromExpr result between them.
+			// plan rather than sharing one plan.FromExpr result between them.
 			t.Run("non-delayed", func(t *testing.T) {
 				expr := preprocess(t, tc.query)
-				p, err := FromExpr(expr)
+				p, err := plan.FromExpr(expr)
 				require.NoError(t, err)
 
-				root, eliminated := EliminateDeduplicateAndMerge(p.Root, false)
-				_, stillWrapped := root.(*DeduplicateAndMergeNode)
+				root, eliminated := plan.EliminateDeduplicateAndMerge(p.Root, false)
+				_, stillWrapped := root.(*plan.DeduplicateAndMergeNode)
 				require.Equal(t, tc.wantEliminatedNonDelay, eliminated > 0 && !stillWrapped)
 				require.Equal(t, !tc.wantEliminatedNonDelay, stillWrapped)
 			})
 
 			t.Run("delayed", func(t *testing.T) {
 				expr := preprocess(t, tc.query)
-				p, err := FromExpr(expr)
+				p, err := plan.FromExpr(expr)
 				require.NoError(t, err)
 
-				root, eliminated := EliminateDeduplicateAndMerge(p.Root, true)
-				_, stillWrapped := root.(*DeduplicateAndMergeNode)
+				root, eliminated := plan.EliminateDeduplicateAndMerge(p.Root, true)
+				_, stillWrapped := root.(*plan.DeduplicateAndMergeNode)
 				require.Equal(t, tc.wantEliminatedDelay, eliminated > 0 && !stillWrapped)
 				require.Equal(t, !tc.wantEliminatedDelay, stillWrapped)
 			})
@@ -223,51 +225,51 @@ func TestEliminateDeduplicateAndMerge(t *testing.T) {
 }
 
 // TestEliminateDeduplicateAndMerge_RoundTrip runs a handful of realistic
-// full queries through FromExpr followed by EliminateDeduplicateAndMerge,
-// and asserts the final plan shape at the spot a DeduplicateAndMergeNode
+// full queries through plan.FromExpr followed by plan.EliminateDeduplicateAndMerge,
+// and asserts the final plan shape at the spot a plan.DeduplicateAndMergeNode
 // would appear.
 func TestEliminateDeduplicateAndMerge_RoundTrip(t *testing.T) {
 	t.Run("sum(rate(foo[5m])) by (job) has no surviving wrap", func(t *testing.T) {
 		expr := preprocess(t, "sum(rate(foo[5m])) by (job)")
-		p, err := FromExpr(expr)
+		p, err := plan.FromExpr(expr)
 		require.NoError(t, err)
 
-		root, eliminated := EliminateDeduplicateAndMerge(p.Root, false)
+		root, eliminated := plan.EliminateDeduplicateAndMerge(p.Root, false)
 		require.Equal(t, 1, eliminated)
 
-		ae, ok := root.(*AggregateExprNode)
-		require.True(t, ok, "expected *AggregateExprNode root, got %T", root)
-		_, ok = ae.Child(0).(*CallNode)
+		ae, ok := root.(*plan.AggregateExprNode)
+		require.True(t, ok, "expected *plan.AggregateExprNode root, got %T", root)
+		_, ok = ae.Child(0).(*plan.CallNode)
 		require.True(t, ok, "expected rate() directly under sum(), got %T", ae.Child(0))
 	})
 
 	t.Run("label_replace(rate(foo[5m]), ...) keeps its wrap", func(t *testing.T) {
 		expr := preprocess(t, `label_replace(rate(foo[5m]), "a", "$1", "b", "(.*)")`)
-		p, err := FromExpr(expr)
+		p, err := plan.FromExpr(expr)
 		require.NoError(t, err)
 
-		root, eliminated := EliminateDeduplicateAndMerge(p.Root, false)
+		root, eliminated := plan.EliminateDeduplicateAndMerge(p.Root, false)
 		// The inner rate(foo[5m]) wrap is eliminated, but the outer
 		// label_replace wrap is not.
 		require.Equal(t, 1, eliminated)
 
-		dedup, ok := root.(*DeduplicateAndMergeNode)
-		require.True(t, ok, "expected surviving *DeduplicateAndMergeNode root, got %T", root)
-		call, ok := dedup.Child(0).(*CallNode)
-		require.True(t, ok, "expected *CallNode under the surviving wrap, got %T", dedup.Child(0))
+		dedup, ok := root.(*plan.DeduplicateAndMergeNode)
+		require.True(t, ok, "expected surviving *plan.DeduplicateAndMergeNode root, got %T", root)
+		call, ok := dedup.Child(0).(*plan.CallNode)
+		require.True(t, ok, "expected *plan.CallNode under the surviving wrap, got %T", dedup.Child(0))
 		require.Equal(t, "label_replace", call.Func.Name)
 	})
 
 	t.Run("foo or bar keeps its wrap", func(t *testing.T) {
 		expr := preprocess(t, "foo or bar")
-		p, err := FromExpr(expr)
+		p, err := plan.FromExpr(expr)
 		require.NoError(t, err)
 
-		root, eliminated := EliminateDeduplicateAndMerge(p.Root, false)
+		root, eliminated := plan.EliminateDeduplicateAndMerge(p.Root, false)
 		require.Equal(t, 0, eliminated)
 
-		_, ok := root.(*DeduplicateAndMergeNode)
-		require.True(t, ok, "expected surviving *DeduplicateAndMergeNode root, got %T", root)
+		_, ok := root.(*plan.DeduplicateAndMergeNode)
+		require.True(t, ok, "expected surviving *plan.DeduplicateAndMergeNode root, got %T", root)
 	})
 
 	t.Run("-abs(rate(foo[5m])) eliminates all three wraps", func(t *testing.T) {
@@ -276,27 +278,27 @@ func TestEliminateDeduplicateAndMerge_RoundTrip(t *testing.T) {
 		// name, not label-modifying), and the unary minus is wrapped on
 		// top of that (negating a vector). None of the three arguments
 		// involved is a scalar literal, so this avoids the
-		// NumberLiteralNode-argument conservatism documented on
+		// plan.NumberLiteralNode-argument conservatism documented on
 		// canEliminateDeduplicateAndMerge (see e.g. clamp(foo, 0, 1), which
 		// can never fully eliminate because of its scalar min/max
 		// arguments) and all three wraps should be eliminated once foo's
 		// exact name matcher is established.
 		expr := preprocess(t, "-abs(rate(foo[5m]))")
-		p, err := FromExpr(expr)
+		p, err := plan.FromExpr(expr)
 		require.NoError(t, err)
 
-		root, eliminated := EliminateDeduplicateAndMerge(p.Root, false)
+		root, eliminated := plan.EliminateDeduplicateAndMerge(p.Root, false)
 		require.Equal(t, 3, eliminated, "expected the rate(), abs(), and unary-minus wraps all eliminated")
 
-		unary, ok := root.(*UnaryExprNode)
-		require.True(t, ok, "expected *UnaryExprNode root (the unary minus operator itself, whose own wrap was eliminated), got %T", root)
+		unary, ok := root.(*plan.UnaryExprNode)
+		require.True(t, ok, "expected *plan.UnaryExprNode root (the unary minus operator itself, whose own wrap was eliminated), got %T", root)
 
-		abs, ok := unary.Child(0).(*CallNode)
-		require.True(t, ok, "expected *CallNode (abs) under the unary minus, got %T", unary.Child(0))
+		abs, ok := unary.Child(0).(*plan.CallNode)
+		require.True(t, ok, "expected *plan.CallNode (abs) under the unary minus, got %T", unary.Child(0))
 		require.Equal(t, "abs", abs.Func.Name)
 
-		rate, ok := abs.Child(0).(*CallNode)
-		require.True(t, ok, "expected *CallNode (rate) under abs, got %T", abs.Child(0))
+		rate, ok := abs.Child(0).(*plan.CallNode)
+		require.True(t, ok, "expected *plan.CallNode (rate) under abs, got %T", abs.Child(0))
 		require.Equal(t, "rate", rate.Func.Name)
 	})
 }

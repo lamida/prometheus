@@ -91,6 +91,17 @@ func (n *VectorSelectorNode) Describe() string {
 		n.Name, len(n.LabelMatchers), n.Offset, formatInt64Ptr(n.Timestamp))
 }
 
+// HasUnstableOffset reports whether n was built from a VectorSelector
+// with its own @ modifier that sits underneath a SubqueryExprNode,
+// making its Offset evaluation-time-dependent (see hasUnstableOffset's
+// doc). EquivalentTo unconditionally treats such a node as never
+// equivalent to any other node, so CommonSubexpressionElimination never
+// merges it. Exported primarily so tests outside this package can assert
+// on this fact directly.
+func (n *VectorSelectorNode) HasUnstableOffset() bool {
+	return n.hasUnstableOffset
+}
+
 // MatrixSelectorNode selects a Matrix of series over a time range, mirroring
 // parser.MatrixSelector. Its single child is the VectorSelectorNode it
 // ranges over.

@@ -11,24 +11,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package plan
+package plan_test
 
 import (
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/prometheus/prometheus/promql/plan"
 )
 
 // buildAndPrepare parses+preprocesses query, builds its plan, and runs
-// NormalizeForCSE on it, matching the order CommonSubexpressionElimination
-// is meant to be called in (see CommonSubexpressionElimination's doc).
-func buildAndPrepare(t *testing.T, query string) Node {
+// plan.NormalizeForCSE on it, matching the order plan.CommonSubexpressionElimination
+// is meant to be called in (see plan.CommonSubexpressionElimination's doc).
+func buildAndPrepare(t *testing.T, query string) plan.Node {
 	t.Helper()
 	expr := preprocess(t, query)
-	p, err := FromExpr(expr)
+	p, err := plan.FromExpr(expr)
 	require.NoError(t, err)
-	NormalizeForCSE(p.Root)
+	plan.NormalizeForCSE(p.Root)
 	return p.Root
 }
 
@@ -36,11 +38,11 @@ func buildAndPrepare(t *testing.T, query string) Node {
 // subtree whose concrete type is T, in the order first encountered by a
 // pre-order walk. A node reachable via more than one parent (already
 // shared) is only included once.
-func findAll[T Node](root Node) []T {
+func findAll[T plan.Node](root plan.Node) []T {
 	var out []T
-	seen := map[Node]bool{}
-	var walk func(n Node)
-	walk = func(n Node) {
+	seen := map[plan.Node]bool{}
+	var walk func(n plan.Node)
+	walk = func(n plan.Node) {
 		if n == nil || seen[n] {
 			return
 		}
@@ -62,15 +64,15 @@ func findAll[T Node](root Node) []T {
 func TestCommonSubexpressionElimination_BasicDuplicateSubtree(t *testing.T) {
 	root := buildAndPrepare(t, "sum(rate(foo[5m])) / sum(rate(foo[5m]))")
 
-	be, ok := root.(*BinaryExprNode)
-	require.True(t, ok, "expected *BinaryExprNode root, got %T", root)
+	be, ok := root.(*plan.BinaryExprNode)
+	require.True(t, ok, "expected *plan.BinaryExprNode root, got %T", root)
 	require.NotSame(t, be.Child(0), be.Child(1), "expected the two sides to be distinct nodes before CSE")
 
-	newRoot, merged := CommonSubexpressionElimination(root)
+	newRoot, merged := plan.CommonSubexpressionElimination(root)
 	require.Positive(t, merged, "expected at least one node to be merged")
 
-	be, ok = newRoot.(*BinaryExprNode)
-	require.True(t, ok, "expected *BinaryExprNode root after CSE, got %T", newRoot)
+	be, ok = newRoot.(*plan.BinaryExprNode)
+	require.True(t, ok, "expected *plan.BinaryExprNode root after CSE, got %T", newRoot)
 
 	lhs := be.Child(0)
 	rhs := be.Child(1)
@@ -88,19 +90,19 @@ func TestCommonSubexpressionElimination_BasicDuplicateSubtree(t *testing.T) {
 // merging a duplicated leaf subexpression that sits under otherwise
 // different parents: abs(foo) and ceil(foo) don't merge themselves, but
 // the inner "foo" selector they both reference should still merge into one
-// shared VectorSelectorNode.
+// shared plan.VectorSelectorNode.
 func TestCommonSubexpressionElimination_SharedLeafUnderDifferentParents(t *testing.T) {
 	root := buildAndPrepare(t, "abs(foo) + ceil(foo)")
 
-	newRoot, merged := CommonSubexpressionElimination(root)
+	newRoot, merged := plan.CommonSubexpressionElimination(root)
 	require.Positive(t, merged)
 
-	selectors := findAll[*VectorSelectorNode](newRoot)
+	selectors := findAll[*plan.VectorSelectorNode](newRoot)
 	require.Len(t, selectors, 1, "expected the two \"foo\" selectors to merge into one shared node")
 	require.Equal(t, 2, selectors[0].ParentCount())
 
-	be, ok := newRoot.(*BinaryExprNode)
-	require.True(t, ok, "expected *BinaryExprNode root, got %T", newRoot)
+	be, ok := newRoot.(*plan.BinaryExprNode)
+	require.True(t, ok, "expected *plan.BinaryExprNode root, got %T", newRoot)
 	require.NotSame(t, be.Child(0), be.Child(1), "expected abs(foo) and ceil(foo) themselves to remain distinct nodes")
 }
 
@@ -111,11 +113,11 @@ func TestCommonSubexpressionElimination_SharedLeafUnderDifferentParents(t *testi
 func TestCommonSubexpressionElimination_TwoNumberLiterals(t *testing.T) {
 	root := buildAndPrepare(t, "5 + 5")
 
-	newRoot, merged := CommonSubexpressionElimination(root)
+	newRoot, merged := plan.CommonSubexpressionElimination(root)
 	require.Equal(t, 1, merged)
 
-	be, ok := newRoot.(*BinaryExprNode)
-	require.True(t, ok, "expected *BinaryExprNode root, got %T", newRoot)
+	be, ok := newRoot.(*plan.BinaryExprNode)
+	require.True(t, ok, "expected *plan.BinaryExprNode root, got %T", newRoot)
 	require.Same(t, be.Child(0), be.Child(1))
 	require.Equal(t, 2, be.Child(0).ParentCount())
 }
@@ -125,35 +127,35 @@ func TestCommonSubexpressionElimination_TwoNumberLiterals(t *testing.T) {
 func TestCommonSubexpressionElimination_DifferentMatchersDoNotMerge(t *testing.T) {
 	root := buildAndPrepare(t, `foo{job="a"} + foo{job="b"}`)
 
-	newRoot, merged := CommonSubexpressionElimination(root)
+	newRoot, merged := plan.CommonSubexpressionElimination(root)
 	require.Equal(t, 0, merged)
 
-	be, ok := newRoot.(*BinaryExprNode)
-	require.True(t, ok, "expected *BinaryExprNode root, got %T", newRoot)
+	be, ok := newRoot.(*plan.BinaryExprNode)
+	require.True(t, ok, "expected *plan.BinaryExprNode root, got %T", newRoot)
 	require.NotSame(t, be.Child(0), be.Child(1))
 }
 
 // TestCommonSubexpressionElimination_DifferentRangesDoNotMerge covers
-// non-equivalence for MatrixSelectorNode.Range: two matrix selectors over
+// non-equivalence for plan.MatrixSelectorNode.Range: two matrix selectors over
 // the same metric but different ranges must not merge, even though their
-// inner VectorSelectorNode (same metric, no offset/matchers difference)
+// inner plan.VectorSelectorNode (same metric, no offset/matchers difference)
 // legitimately does.
 func TestCommonSubexpressionElimination_DifferentRangesDoNotMerge(t *testing.T) {
 	root := buildAndPrepare(t, "sum_over_time(foo[5m]) + sum_over_time(foo[10m])")
 
-	newRoot, merged := CommonSubexpressionElimination(root)
+	newRoot, merged := plan.CommonSubexpressionElimination(root)
 
-	be, ok := newRoot.(*BinaryExprNode)
-	require.True(t, ok, "expected *BinaryExprNode root, got %T", newRoot)
+	be, ok := newRoot.(*plan.BinaryExprNode)
+	require.True(t, ok, "expected *plan.BinaryExprNode root, got %T", newRoot)
 	require.NotSame(t, be.Child(0), be.Child(1), "expected the two differently-ranged sum_over_time chains to remain distinct")
 
-	unwrap := func(n Node) *MatrixSelectorNode {
-		dedup, ok := n.(*DeduplicateAndMergeNode)
-		require.True(t, ok, "expected *DeduplicateAndMergeNode, got %T", n)
-		call, ok := dedup.Child(0).(*CallNode)
-		require.True(t, ok, "expected *CallNode, got %T", dedup.Child(0))
-		ms, ok := call.Child(0).(*MatrixSelectorNode)
-		require.True(t, ok, "expected *MatrixSelectorNode, got %T", call.Child(0))
+	unwrap := func(n plan.Node) *plan.MatrixSelectorNode {
+		dedup, ok := n.(*plan.DeduplicateAndMergeNode)
+		require.True(t, ok, "expected *plan.DeduplicateAndMergeNode, got %T", n)
+		call, ok := dedup.Child(0).(*plan.CallNode)
+		require.True(t, ok, "expected *plan.CallNode, got %T", dedup.Child(0))
+		ms, ok := call.Child(0).(*plan.MatrixSelectorNode)
+		require.True(t, ok, "expected *plan.MatrixSelectorNode, got %T", call.Child(0))
 		return ms
 	}
 	ms0 := unwrap(be.Child(0))
@@ -169,57 +171,57 @@ func TestCommonSubexpressionElimination_DifferentRangesDoNotMerge(t *testing.T) 
 }
 
 // TestCommonSubexpressionElimination_DifferentOffsetsDoNotMerge covers
-// non-equivalence for VectorSelectorNode.Offset. preprocess (this
+// non-equivalence for plan.VectorSelectorNode.Offset. preprocess (this
 // package's test helper) never calls promql/engine.go's unexported
-// setOffsetForAtModifier — see FromExpr's doc comment on why that call,
+// setOffsetForAtModifier — see plan.FromExpr's doc comment on why that call,
 // not just parser.PreprocessExpr, is what actually populates .Offset — so
 // a real "foo offset 1m" parsed and preprocessed by this test's helper
-// still has VectorSelectorNode.Offset == 0. To exercise Offset-based
+// still has plan.VectorSelectorNode.Offset == 0. To exercise Offset-based
 // non-equivalence directly, this test instead sets Offset by hand on
 // already-built nodes, which is the direct approach for a field this
 // package's own exported API lets a caller set without needing engine.go.
 func TestCommonSubexpressionElimination_DifferentOffsetsDoNotMerge(t *testing.T) {
 	root := buildAndPrepare(t, "foo + foo")
-	be, ok := root.(*BinaryExprNode)
-	require.True(t, ok, "expected *BinaryExprNode root, got %T", root)
+	be, ok := root.(*plan.BinaryExprNode)
+	require.True(t, ok, "expected *plan.BinaryExprNode root, got %T", root)
 
-	lhs, ok := be.Child(0).(*VectorSelectorNode)
+	lhs, ok := be.Child(0).(*plan.VectorSelectorNode)
 	require.True(t, ok)
-	rhs, ok := be.Child(1).(*VectorSelectorNode)
+	rhs, ok := be.Child(1).(*plan.VectorSelectorNode)
 	require.True(t, ok)
 	lhs.Offset = time.Minute
 	rhs.Offset = 2 * time.Minute
 
-	newRoot, merged := CommonSubexpressionElimination(root)
+	newRoot, merged := plan.CommonSubexpressionElimination(root)
 	require.Equal(t, 0, merged)
 
-	be, ok = newRoot.(*BinaryExprNode)
+	be, ok = newRoot.(*plan.BinaryExprNode)
 	require.True(t, ok)
 	require.NotSame(t, be.Child(0), be.Child(1))
 }
 
 // TestCommonSubexpressionElimination_AtModifierUnderSubqueryNeverMerges
-// covers the deliberate v1 conservatism: a VectorSelectorNode carrying its
-// own @ modifier, sitting anywhere underneath a SubqueryExprNode, must
+// covers the deliberate v1 conservatism: a plan.VectorSelectorNode carrying its
+// own @ modifier, sitting anywhere underneath a plan.SubqueryExprNode, must
 // never be considered equivalent to anything, including a
-// structurally-identical twin. See VectorSelectorNode.hasUnstableOffset's
+// structurally-identical twin. See plan.VectorSelectorNode.hasUnstableOffset's
 // doc and docs/query-planner-phase2-design.md §3, Open Question 1.
 func TestCommonSubexpressionElimination_AtModifierUnderSubqueryNeverMerges(t *testing.T) {
 	root := buildAndPrepare(t, "sum_over_time((foo @ 100)[5m:1m]) + sum_over_time((foo @ 100)[5m:1m])")
 
-	selectorsBefore := findAll[*VectorSelectorNode](root)
+	selectorsBefore := findAll[*plan.VectorSelectorNode](root)
 	require.Len(t, selectorsBefore, 2, "expected two distinct selector instances before CSE")
-	require.True(t, selectorsBefore[0].hasUnstableOffset, "expected the @-under-subquery selector to be flagged unstable")
-	require.True(t, selectorsBefore[1].hasUnstableOffset)
+	require.True(t, selectorsBefore[0].HasUnstableOffset(), "expected the @-under-subquery selector to be flagged unstable")
+	require.True(t, selectorsBefore[1].HasUnstableOffset())
 
 	// Even though the two selectors are otherwise byte-for-byte identical
 	// (same name, matchers, offset, timestamp), EquivalentTo must refuse to
 	// call them equivalent.
 	require.False(t, selectorsBefore[0].EquivalentTo(selectorsBefore[1]))
 
-	newRoot, merged := CommonSubexpressionElimination(root)
+	newRoot, merged := plan.CommonSubexpressionElimination(root)
 
-	selectorsAfter := findAll[*VectorSelectorNode](newRoot)
+	selectorsAfter := findAll[*plan.VectorSelectorNode](newRoot)
 	require.Len(t, selectorsAfter, 2, "expected the two @-under-subquery selectors to remain distinct after CSE")
 	require.Equal(t, 1, selectorsAfter[0].ParentCount())
 	require.Equal(t, 1, selectorsAfter[1].ParentCount())
@@ -238,15 +240,15 @@ func TestCommonSubexpressionElimination_AtModifierUnderSubqueryNeverMerges(t *te
 func TestCommonSubexpressionElimination_AtModifierWithoutSubqueryDoesMerge(t *testing.T) {
 	root := buildAndPrepare(t, "(foo @ 100) + (foo @ 100)")
 
-	selectorsBefore := findAll[*VectorSelectorNode](root)
+	selectorsBefore := findAll[*plan.VectorSelectorNode](root)
 	require.Len(t, selectorsBefore, 2)
-	require.False(t, selectorsBefore[0].hasUnstableOffset, "expected the @ selector to be stable when not nested under a subquery")
-	require.False(t, selectorsBefore[1].hasUnstableOffset)
+	require.False(t, selectorsBefore[0].HasUnstableOffset(), "expected the @ selector to be stable when not nested under a subquery")
+	require.False(t, selectorsBefore[1].HasUnstableOffset())
 
-	newRoot, merged := CommonSubexpressionElimination(root)
+	newRoot, merged := plan.CommonSubexpressionElimination(root)
 	require.Equal(t, 1, merged)
 
-	selectorsAfter := findAll[*VectorSelectorNode](newRoot)
+	selectorsAfter := findAll[*plan.VectorSelectorNode](newRoot)
 	require.Len(t, selectorsAfter, 1, "expected the two @ selectors to merge into one shared node")
 	require.Equal(t, 2, selectorsAfter[0].ParentCount())
 }
@@ -261,16 +263,16 @@ func TestCommonSubexpressionElimination_AtModifierWithoutSubqueryDoesMerge(t *te
 func TestCommonSubexpressionElimination_DifferentSubqueryRangesDoNotMerge(t *testing.T) {
 	root := buildAndPrepare(t, "sum_over_time(foo[5m:1m]) + sum_over_time(foo[10m:1m])")
 
-	newRoot, merged := CommonSubexpressionElimination(root)
+	newRoot, merged := plan.CommonSubexpressionElimination(root)
 
-	be, ok := newRoot.(*BinaryExprNode)
-	require.True(t, ok, "expected *BinaryExprNode root, got %T", newRoot)
+	be, ok := newRoot.(*plan.BinaryExprNode)
+	require.True(t, ok, "expected *plan.BinaryExprNode root, got %T", newRoot)
 	require.NotSame(t, be.Child(0), be.Child(1), "expected the two differently-ranged subquery chains to remain distinct")
 
-	subqueries := findAll[*SubqueryExprNode](newRoot)
+	subqueries := findAll[*plan.SubqueryExprNode](newRoot)
 	require.Len(t, subqueries, 2, "expected the two SubqueryExprNodes (different ranges) to remain distinct")
 
-	selectors := findAll[*VectorSelectorNode](newRoot)
+	selectors := findAll[*plan.VectorSelectorNode](newRoot)
 	require.Len(t, selectors, 1, "expected the shared inner \"foo\" selector to merge despite the differing subquery ranges")
 	require.Equal(t, 2, selectors[0].ParentCount())
 	require.Positive(t, merged)
