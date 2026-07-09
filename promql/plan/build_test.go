@@ -123,8 +123,15 @@ func TestFromExpr_NestedSubquery(t *testing.T) {
 	p, err := FromExpr(expr)
 	require.NoError(t, err)
 
-	call, ok := p.Root.(*CallNode)
-	require.True(t, ok, "expected *CallNode, got %T", p.Root)
+	// sum_over_time is a range-vector function other than last_over_time/
+	// first_over_time, so FromExpr wraps it in a DeduplicateAndMergeNode
+	// (see dedup.go's callNeedsDeduplicationWrap); unwrap it to get at the
+	// CallNode this test is actually about.
+	dedup, ok := p.Root.(*DeduplicateAndMergeNode)
+	require.True(t, ok, "expected *DeduplicateAndMergeNode, got %T", p.Root)
+
+	call, ok := dedup.Child(0).(*CallNode)
+	require.True(t, ok, "expected *CallNode, got %T", dedup.Child(0))
 	require.Equal(t, "sum_over_time", call.Func.Name)
 	require.Equal(t, 1, call.ChildCount())
 
@@ -144,8 +151,15 @@ func TestFromExpr_CallWithMultipleArgs(t *testing.T) {
 	p, err := FromExpr(expr)
 	require.NoError(t, err)
 
-	call, ok := p.Root.(*CallNode)
-	require.True(t, ok, "expected *CallNode, got %T", p.Root)
+	// clamp drops the __name__ label (see dedup.go's
+	// callNeedsDeduplicationWrap), so FromExpr wraps it in a
+	// DeduplicateAndMergeNode; unwrap it to get at the CallNode this test
+	// is actually about.
+	dedup, ok := p.Root.(*DeduplicateAndMergeNode)
+	require.True(t, ok, "expected *DeduplicateAndMergeNode, got %T", p.Root)
+
+	call, ok := dedup.Child(0).(*CallNode)
+	require.True(t, ok, "expected *CallNode, got %T", dedup.Child(0))
 	require.Equal(t, "clamp", call.Func.Name)
 	require.Equal(t, 3, call.ChildCount())
 
