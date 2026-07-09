@@ -42,6 +42,7 @@
     "negative_offset": true,
     "offset": true,
     "on": true,
+    "optimization_passes": false,
     "per_query_lookback_delta": true,
     "per_step_stats": false,
     "smoothed": false,

@@ -43,6 +43,7 @@ import (
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/timestamp"
 	"github.com/prometheus/prometheus/model/value"
+	"github.com/prometheus/prometheus/promql/optimize"
 	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/prometheus/prometheus/promql/parser/posrange"
 	"github.com/prometheus/prometheus/schema"
@@ -337,6 +338,12 @@ type EngineOpts struct {
 	// UseStartTimestamps enables start timestamp usage in functions such as rate().
 	UseStartTimestamps bool
 
+	// EnableOptimizationPasses, if true, runs the promql/optimize pass
+	// pipeline over a parsed query before evaluation, rewriting it into an
+	// equivalent but cheaper-to-evaluate form (e.g. removing duplicate label
+	// matchers). Disabled by default: this is a new, opt-in code path.
+	EnableOptimizationPasses bool
+
 	// FeatureRegistry is the registry for tracking enabled/disabled features.
 	FeatureRegistry features.Collector
 
@@ -363,6 +370,7 @@ type Engine struct {
 	enableTypeAndUnitLabels  bool
 	useStartTimestamps       bool
 	parser                   parser.Parser
+	optimizePipeline         *optimize.Pipeline
 }
 
 // NewEngine returns a new engine.
@@ -477,12 +485,18 @@ func NewEngine(opts EngineOpts) *Engine {
 		r.Set(features.PromQL, "per_step_stats", opts.EnablePerStepStats)
 		r.Set(features.PromQL, "delayed_name_removal", opts.EnableDelayedNameRemoval)
 		r.Set(features.PromQL, "type_and_unit_labels", opts.EnableTypeAndUnitLabels)
+		r.Set(features.PromQL, "optimization_passes", opts.EnableOptimizationPasses)
 		r.Enable(features.PromQL, "per_query_lookback_delta")
 		r.Enable(features.PromQL, "subqueries")
 
 		if opts.Parser != nil {
 			opts.Parser.RegisterFeatures(r)
 		}
+	}
+
+	var optimizePipeline *optimize.Pipeline
+	if opts.EnableOptimizationPasses {
+		optimizePipeline = optimize.NewPipeline(optimize.ReduceMatchers{})
 	}
 
 	return &Engine{
@@ -497,6 +511,7 @@ func NewEngine(opts EngineOpts) *Engine {
 		enableNegativeOffset:     opts.EnableNegativeOffset,
 		enablePerStepStats:       opts.EnablePerStepStats,
 		enableDelayedNameRemoval: opts.EnableDelayedNameRemoval,
+		optimizePipeline:         optimizePipeline,
 		enableTypeAndUnitLabels:  opts.EnableTypeAndUnitLabels,
 		useStartTimestamps:       opts.UseStartTimestamps,
 		parser:                   opts.Parser,
@@ -555,6 +570,10 @@ func (ng *Engine) NewInstantQuery(ctx context.Context, q storage.Queryable, opts
 	if err := ng.validateOpts(expr); err != nil {
 		return nil, err
 	}
+	expr, err = ng.optimizePipeline.Apply(ctx, expr, ts, ts, 0)
+	if err != nil {
+		return nil, err
+	}
 	*pExpr, err = PreprocessExpr(expr, ts, ts, 0)
 
 	return qry, err
@@ -578,6 +597,10 @@ func (ng *Engine) NewRangeQuery(ctx context.Context, q storage.Queryable, opts Q
 	}
 	if expr.Type() != parser.ValueTypeVector && expr.Type() != parser.ValueTypeScalar {
 		return nil, fmt.Errorf("invalid expression type %q for range query, must be Scalar or instant Vector", parser.DocumentedType(expr.Type()))
+	}
+	expr, err = ng.optimizePipeline.Apply(ctx, expr, start, end, interval)
+	if err != nil {
+		return nil, err
 	}
 	*pExpr, err = PreprocessExpr(expr, start, end, interval)
 
