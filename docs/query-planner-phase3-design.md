@@ -201,6 +201,59 @@ and the structural argument in §2-§3 suggests one may not exist. §4's
 benchmark is the concrete, cheap, low-risk next step that would either
 produce that number or confirm there isn't one to chase.
 
+## §4 results: the benchmark, run
+
+`promql/multiaggregation_bench_test.go` (`BenchmarkMultiAggregationCandidate`)
+implements §4's proposal directly: for `n` in {2, 4, 6} aggregation operators
+sharing one input, at two series cardinalities (ten series, hundred series),
+it measures `single` (one aggregation, the baseline), `shared_no_cse` (`n`
+aggregations over the textually identical input, CSE disabled — the "nothing
+deduplicated" reference), `shared_cse` (same query, CSE enabled), and
+`unshared_no_cse` (`n` aggregations over `n` distinct inputs of the same
+shape — an "no duplicate subexpression exists to share" reference,
+independent of CSE).
+
+Measured on this machine (Apple M4 Pro, `-benchtime=10x`; absolute numbers
+will vary by hardware, the ratios between columns are what matters):
+
+| cardinality | n | single | shared\_no\_cse | shared\_cse | shared\_cse ÷ single |
+|---|---|---|---|---|---|
+| ten     | 2 | 1.60ms  | 3.22ms  | 1.73ms  | 1.08× |
+| ten     | 4 | 1.45ms  | 6.24ms  | 1.98ms  | 1.37× |
+| ten     | 6 | 1.67ms  | 9.67ms  | 2.51ms  | 1.50× |
+| hundred | 2 | 14.5ms  | 29.8ms  | 15.4ms  | 1.06× |
+| hundred | 4 | 14.4ms  | 60.0ms  | 16.9ms  | 1.17× |
+| hundred | 6 | 15.0ms  | 91.9ms  | 18.5ms  | 1.23× |
+
+`shared_no_cse` scales almost exactly linearly with `n` (as expected: nothing
+dedupes the repeated input production), confirming the harness measures what
+it claims to. `shared_cse` stays close to `single` even at `n=6` — 1.23–1.50×,
+not the 6× `shared_no_cse` shows — confirming CSE's already-merged Strategy A
+wiring captures the overwhelming majority of the available win on its own,
+exactly as §2 argued from tracing the code.
+
+Solving the two linear equations `shared_no_cse(n) ≈ n·(input + agg)` and
+`shared_cse(n) ≈ input + n·agg` (`input` = cost of producing the shared
+subexpression once, `agg` = one aggregation's own marginal
+grouping/accumulation cost) against the `cardinality=hundred` measurements
+gives `input ≈ 14.2ms`, `agg ≈ 0.72ms`. Input production is ~95% of a
+single aggregation's total cost at this cardinality; the residual `(n-1)·agg`
+a hypothetical fused-aggregation mechanism could still theoretically capture
+is ~3.6ms at `n=6` — real, but small relative to both `single` (15.0ms) and
+the ~73ms `shared_no_cse − shared_cse` gap CSE has already closed.
+
+This is direct evidence for this document's recommendation, not just the
+structural argument §2-§3 made before it: the answer to Open Question 1 is
+"no" for every shape this benchmark covers (up to `n=6`, hundred-series
+cardinality) — `rangeEvalAgg`'s own cost does not dominate post-CSE total
+query time anywhere in this range; it stays a small, roughly `n`-linear
+addition on top of an already-CSE'd, cardinality-dominated baseline. A
+query shape with a starkly different cost profile (e.g. `n` in the dozens,
+or aggregations so cheap per-series that grouping overhead could plausibly
+dominate) is not ruled out by this benchmark and would be worth checking
+before fully closing Open Question 1, but nothing in the shapes tested here
+supports building the feature.
+
 ## Open questions
 
 1. Is there a realistic, common query shape (high cardinality, many
