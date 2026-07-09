@@ -88,3 +88,24 @@ load 30s
 		})
 	}
 }
+
+func TestPropagateMatchers_PreservesSemantics(t *testing.T) {
+	const loadStmts = `
+load 30s
+	up{job="a", instance="0"}	1x100
+	up{job="b", instance="0"}	1x100
+	down{job="a", instance="0"}	1x100
+	down{job="b", instance="0"}	1x100
+`
+	queries := []string{
+		`up{job="a"} == on(job) down`,
+		`up == on(job) down{job="a"}`,
+		`up{job="a"} == on(job) down{job="b"}`,
+		`up == on(job) down`,
+	}
+	for _, q := range queries {
+		t.Run(q, func(t *testing.T) {
+			assertPassPreservesSemantics(t, optimize.PropagateMatchers{}, loadStmts, q)
+		})
+	}
+}
