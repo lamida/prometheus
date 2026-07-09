@@ -33,6 +33,32 @@ import (
 // parser.ParenExpr and parser.StepInvariantExpr wrappers entirely rather
 // than modeling them as plan nodes.
 //
+// PreprocessExpr alone is not sufficient for a node's .Offset to be
+// trustworthy — for any node, with or without its own @ modifier. Only
+// promql/engine.go's setOffsetForAtModifier ever assigns a
+// *parser.VectorSelector/*parser.MatrixSelector/*parser.SubqueryExpr's
+// .Offset field at all: PreprocessExpr never touches it, so it sits at its
+// Go zero value on every node, offset modifier or not, until
+// setOffsetForAtModifier runs. The caller must also have run the top-level
+// call to it (the one in execEvalStmt, using the query's own start time as
+// evalTime, around engine.go:825) before calling FromExpr, in addition to
+// PreprocessExpr.
+//
+// For a node without its own @ modifier (Timestamp == nil),
+// setOffsetForAtModifier's getOffset closure just copies .OriginalOffset
+// into .Offset unconditionally (see engine.go:4640's `if ts == nil {
+// return originalOffset }`), so it doesn't matter when — or how many times
+// — that top-level call runs: the resulting .Offset is the same regardless
+// of subquery nesting or evaluation time, and is safe to snapshot once at
+// plan-build time. A node WITH its own @ modifier is different: if it also
+// sits under a SubqueryExpr anywhere in its ancestry, setOffsetForAtModifier
+// recomputes its .Offset again on every subquery iteration (see
+// evalSubquery, engine.go:2005), using that iteration's own runtime
+// evalTime, so no single value captured once at plan-build time is sound
+// for it at all — see this package's hasUnstableOffset fields (nodes.go)
+// and docs/query-planner-phase2-design.md §3, Open Question 1, which is
+// exactly this case.
+//
 // parser.ParenExpr carries no information beyond operator-precedence
 // grouping, which the plan graph's explicit parent/child edges already make
 // unambiguous, so it is unwrapped: FromExpr recurses directly into its
@@ -72,19 +98,31 @@ import (
 // only by the elimination side, which by contrast has no parser.Expr to
 // consult).
 func FromExpr(expr parser.Expr) (*QueryPlan, error) {
-	root, err := fromExpr(expr)
+	root, err := fromExpr(expr, false)
 	if err != nil {
 		return nil, err
 	}
 	return &QueryPlan{Root: root}, nil
 }
 
-func fromExpr(expr parser.Expr) (Node, error) {
+// fromExpr is FromExpr's recursive worker. insideSubquery reports whether
+// expr sits anywhere underneath a *parser.SubqueryExpr in the walk so far;
+// it starts false at FromExpr's top-level call and, once a
+// *parser.SubqueryExpr is entered, is forced to true for that subquery's
+// child and stays true for every node beneath it (it never resets back to
+// false partway down a subtree). This is threaded through purely to
+// compute VectorSelectorNode/SubqueryExprNode's hasUnstableOffset field
+// (see nodes.go): a node with its own @ modifier that sits under a
+// subquery has no single evaluation-time-independent Offset, per
+// setOffsetForAtModifier's re-evaluation on every subquery iteration (see
+// evalSubquery, engine.go:2005) — see docs/query-planner-phase2-design.md
+// §3, Open Question 1.
+func fromExpr(expr parser.Expr, insideSubquery bool) (Node, error) {
 	switch e := expr.(type) {
 	case *parser.ParenExpr:
-		return fromExpr(e.Expr)
+		return fromExpr(e.Expr, insideSubquery)
 	case *parser.StepInvariantExpr:
-		return fromExpr(e.Expr)
+		return fromExpr(e.Expr, insideSubquery)
 
 	case *parser.VectorSelector:
 		return &VectorSelectorNode{
@@ -93,10 +131,11 @@ func fromExpr(expr parser.Expr) (Node, error) {
 			Offset:               e.Offset,
 			Timestamp:            e.Timestamp,
 			SkipHistogramBuckets: e.SkipHistogramBuckets,
+			hasUnstableOffset:    e.Timestamp != nil && insideSubquery,
 		}, nil
 
 	case *parser.MatrixSelector:
-		child, err := fromExpr(e.VectorSelector)
+		child, err := fromExpr(e.VectorSelector, insideSubquery)
 		if err != nil {
 			return nil, err
 		}
@@ -105,11 +144,11 @@ func fromExpr(expr parser.Expr) (Node, error) {
 		return n, nil
 
 	case *parser.BinaryExpr:
-		lhs, err := fromExpr(e.LHS)
+		lhs, err := fromExpr(e.LHS, insideSubquery)
 		if err != nil {
 			return nil, err
 		}
-		rhs, err := fromExpr(e.RHS)
+		rhs, err := fromExpr(e.RHS, insideSubquery)
 		if err != nil {
 			return nil, err
 		}
@@ -122,7 +161,7 @@ func fromExpr(expr parser.Expr) (Node, error) {
 		return wrapInDeduplicateAndMerge(n, binaryExprNeedsDeduplicateAndMerge(e)), nil
 
 	case *parser.AggregateExpr:
-		child, err := fromExpr(e.Expr)
+		child, err := fromExpr(e.Expr, insideSubquery)
 		if err != nil {
 			return nil, err
 		}
@@ -134,7 +173,7 @@ func fromExpr(expr parser.Expr) (Node, error) {
 		}
 		children := []Node{child}
 		if e.Param != nil {
-			param, err := fromExpr(e.Param)
+			param, err := fromExpr(e.Param, insideSubquery)
 			if err != nil {
 				return nil, err
 			}
@@ -146,7 +185,7 @@ func fromExpr(expr parser.Expr) (Node, error) {
 	case *parser.Call:
 		children := make([]Node, 0, len(e.Args))
 		for _, arg := range e.Args {
-			child, err := fromExpr(arg)
+			child, err := fromExpr(arg, insideSubquery)
 			if err != nil {
 				return nil, err
 			}
@@ -157,15 +196,19 @@ func fromExpr(expr parser.Expr) (Node, error) {
 		return wrapInDeduplicateAndMerge(n, callExprNeedsDeduplicateAndMerge(e)), nil
 
 	case *parser.SubqueryExpr:
-		child, err := fromExpr(e.Expr)
+		// Every node beneath a subquery's own child is, from here on down,
+		// "inside a subquery" — including further-nested subqueries, which
+		// only ever make the ancestry longer, never shorter.
+		child, err := fromExpr(e.Expr, true)
 		if err != nil {
 			return nil, err
 		}
 		n := &SubqueryExprNode{
-			Range:     e.Range,
-			Offset:    e.Offset,
-			Timestamp: e.Timestamp,
-			Step:      e.Step,
+			Range:             e.Range,
+			Offset:            e.Offset,
+			Timestamp:         e.Timestamp,
+			Step:              e.Step,
+			hasUnstableOffset: e.Timestamp != nil && insideSubquery,
 		}
 		n.SetChildren([]Node{child})
 		return n, nil
@@ -177,7 +220,7 @@ func fromExpr(expr parser.Expr) (Node, error) {
 		return &StringLiteralNode{Val: e.Val}, nil
 
 	case *parser.UnaryExpr:
-		child, err := fromExpr(e.Expr)
+		child, err := fromExpr(e.Expr, insideSubquery)
 		if err != nil {
 			return nil, err
 		}
