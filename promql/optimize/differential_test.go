@@ -11,7 +11,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package optimize
+// This file is package optimize_test, not optimize, because it imports
+// promql to run queries end to end. promql itself imports promql/optimize
+// (to build its default optimization pipeline), so an internal test file
+// here that also imported promql would make the optimize package's test
+// binary depend on itself through promql, an import cycle Go test builds
+// reject. The external test package avoids that: it only depends on
+// optimize's exported API, exactly like any other caller of this package.
+package optimize_test
 
 import (
 	"context"
@@ -21,6 +28,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/prometheus/prometheus/promql"
+	"github.com/prometheus/prometheus/promql/optimize"
 	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/prometheus/prometheus/promql/promqltest"
 )
@@ -33,7 +41,7 @@ import (
 // itself: it exercises the pass exactly as a caller would (parse, rewrite,
 // re-render to a query string) against Prometheus's real, unmodified query
 // engine.
-func assertPassPreservesSemantics(t *testing.T, pass ASTOptimizationPass, loadStmts, query string) {
+func assertPassPreservesSemantics(t *testing.T, pass optimize.ASTOptimizationPass, loadStmts, query string) {
 	t.Helper()
 
 	storage := promqltest.LoadedStorage(t, loadStmts)
@@ -76,7 +84,7 @@ load 30s
 	}
 	for _, q := range queries {
 		t.Run(q, func(t *testing.T) {
-			assertPassPreservesSemantics(t, ReduceMatchers{}, loadStmts, q)
+			assertPassPreservesSemantics(t, optimize.ReduceMatchers{}, loadStmts, q)
 		})
 	}
 }
