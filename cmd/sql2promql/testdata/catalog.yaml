@@ -1,0 +1,9 @@
+tables:
+  http_requests:
+    metric: http_requests_total
+    value_column: value
+    columns:
+      job: job
+      instance: instance
+      status: status
+      method: method
