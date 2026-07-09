@@ -101,6 +101,33 @@ func (p *QueryPlan) String() string {
 type baseNode struct {
 	children []Node
 	parents  int
+
+	// occurrences records, for every real parser.Expr occurrence that was
+	// canonicalized onto this node (by CommonSubexpressionElimination), how
+	// to materialize that occurrence back onto the real parser.Expr tree.
+	// A node built by FromExpr starts with exactly one occurrence (FromExpr
+	// never introduces sharing); cseCanonicalizer.canonicalize appends a
+	// merged node's occurrences onto its survivor's slice so none are lost.
+	// See materialize.go's occurrenceRecord and MaterializeSharing.
+	occurrences []occurrenceRecord
+}
+
+// addOccurrence appends o to b's occurrence list.
+func (b *baseNode) addOccurrence(o occurrenceRecord) {
+	b.occurrences = append(b.occurrences, o)
+}
+
+// addOccurrences appends every element of os to b's occurrence list, in
+// order. Used by CommonSubexpressionElimination to transfer a merged node's
+// occurrences onto its surviving canonical node.
+func (b *baseNode) addOccurrences(os []occurrenceRecord) {
+	b.occurrences = append(b.occurrences, os...)
+}
+
+// occurrenceRecords returns b's occurrence list. The returned slice must
+// not be mutated by the caller.
+func (b *baseNode) occurrenceRecords() []occurrenceRecord {
+	return b.occurrences
 }
 
 // ChildCount returns the number of direct children of this node.

@@ -101,6 +101,17 @@ func (c *cseCanonicalizer) canonicalize(n Node) Node {
 		if cseNodesEqual(n, cand) {
 			c.resolved[n] = cand
 			c.merged++
+			// n is being discarded in favor of cand: transfer n's own
+			// occurrence records (how to materialize the real
+			// parser.Expr occurrence(s) n represented) onto the
+			// survivor so MaterializeSharing still sees them. Every
+			// node implements occurrenceHolder via baseNode, so this
+			// type assertion never fails for a real plan Node.
+			if holder, ok := n.(occurrenceHolder); ok {
+				if candHolder, ok := cand.(occurrenceHolder); ok {
+					candHolder.addOccurrences(holder.occurrenceRecords())
+				}
+			}
 			return cand
 		}
 	}
