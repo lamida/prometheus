@@ -41,6 +41,26 @@ type VectorSelectorNode struct {
 	Timestamp *int64
 	// SkipHistogramBuckets mirrors parser.VectorSelector.SkipHistogramBuckets.
 	SkipHistogramBuckets bool
+
+	// hasUnstableOffset is set by FromExpr when this selector carries its
+	// own @ modifier (Timestamp != nil) AND sits anywhere underneath a
+	// SubqueryExprNode. In that case Offset, though a concrete
+	// time.Duration value, is not a stable, evaluation-time-independent
+	// fact about this node: setOffsetForAtModifier (promql/engine.go:4639)
+	// recomputes it fresh on every subquery iteration, using that
+	// iteration's own runtime evalTime (see evalSubquery,
+	// engine.go:2005), and no single resolved value snapshotted once at
+	// plan-build time can soundly stand in for all of those iterations. A
+	// selector without its own @ modifier never has this problem: its
+	// OriginalOffset is nesting-independent regardless of how many
+	// subqueries it sits under (see getOffset's `if ts == nil { return
+	// originalOffset }` case inside setOffsetForAtModifier). CSE must
+	// never consider two such nodes equivalent — see EquivalentTo below —
+	// as a deliberate v1 conservatism, not a bug: this is the exact case
+	// docs/query-planner-phase2-design.md §3's Open Question 1 flags as
+	// genuinely uncertain, and the decision is to never share these nodes
+	// rather than try to resolve the uncertainty now.
+	hasUnstableOffset bool
 }
 
 // ChildCount always returns 0: a vector selector is a leaf node.
@@ -48,10 +68,14 @@ func (n *VectorSelectorNode) ChildCount() int { return 0 }
 
 // EquivalentTo reports whether other is a VectorSelectorNode selecting the
 // same name, matchers, offset, timestamp, and histogram-bucket-skipping
-// behavior as n.
+// behavior as n. If either n or other has hasUnstableOffset set,
+// EquivalentTo unconditionally returns false: see hasUnstableOffset's doc.
 func (n *VectorSelectorNode) EquivalentTo(other Node) bool {
 	o, ok := other.(*VectorSelectorNode)
 	if !ok {
+		return false
+	}
+	if n.hasUnstableOffset || o.hasUnstableOffset {
 		return false
 	}
 	return n.Name == o.Name &&
@@ -145,7 +169,12 @@ type AggregateExprNode struct {
 }
 
 // EquivalentTo reports whether other is an AggregateExprNode with the same
-// operation and grouping behavior as n.
+// operation and grouping behavior as n. Grouping is compared in order
+// (slices.Equal); NormalizeForCSE (normalize.go) sorts it once, up front,
+// so this order-sensitive comparison still produces the semantically
+// correct order-independent answer — see NormalizeForCSE's doc for why
+// Grouping's order is semantically irrelevant (promql/engine.go sorts it
+// itself before use).
 func (n *AggregateExprNode) EquivalentTo(other Node) bool {
 	o, ok := other.(*AggregateExprNode)
 	if !ok {
@@ -206,13 +235,26 @@ type SubqueryExprNode struct {
 	Timestamp *int64
 	// Step is the subquery's resolved step.
 	Step time.Duration
+
+	// hasUnstableOffset is set by FromExpr when this subquery carries its
+	// own @ modifier (Timestamp != nil) AND sits underneath another,
+	// enclosing SubqueryExprNode. See VectorSelectorNode.hasUnstableOffset
+	// for the full reasoning: the same nesting-dependent recomputation by
+	// setOffsetForAtModifier applies here, since *parser.SubqueryExpr is
+	// one of the three node types getOffset handles.
+	hasUnstableOffset bool
 }
 
 // EquivalentTo reports whether other is a SubqueryExprNode with the same
-// range, offset, timestamp, and step as n.
+// range, offset, timestamp, and step as n. If either n or other has
+// hasUnstableOffset set, EquivalentTo unconditionally returns false: see
+// hasUnstableOffset's doc.
 func (n *SubqueryExprNode) EquivalentTo(other Node) bool {
 	o, ok := other.(*SubqueryExprNode)
 	if !ok {
+		return false
+	}
+	if n.hasUnstableOffset || o.hasUnstableOffset {
 		return false
 	}
 	return n.Range == o.Range &&
@@ -328,9 +370,9 @@ func formatInt64Ptr(v *int64) string {
 
 // equalMatchers reports whether a and b contain the same matchers in the
 // same order. Order matters here because normalizing (sorting) matchers
-// before comparison is a separate future pass — see
-// docs/query-planner-phase2-design.md §3 — not something EquivalentTo does
-// on every pairwise comparison.
+// before comparison is a separate pass, NormalizeForCSE (see normalize.go
+// and docs/query-planner-phase2-design.md §3), not something EquivalentTo
+// does on every pairwise comparison.
 func equalMatchers(a, b []*labels.Matcher) bool {
 	if len(a) != len(b) {
 		return false
@@ -345,7 +387,10 @@ func equalMatchers(a, b []*labels.Matcher) bool {
 }
 
 // equalVectorMatching reports whether a and b describe the same vector
-// matching behavior.
+// matching behavior. Like equalMatchers, this compares MatchingLabels and
+// Include in order; NormalizeForCSE (normalize.go) sorts both label lists
+// once, up front, precisely so that this order-sensitive comparison still
+// produces the semantically correct order-independent answer.
 func equalVectorMatching(a, b *parser.VectorMatching) bool {
 	if a == nil || b == nil {
 		return a == b
