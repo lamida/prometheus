@@ -31,6 +31,7 @@
     "at_modifier": true,
     "bool": true,
     "by": true,
+    "common_subexpression_elimination": false,
     "delayed_name_removal": false,
     "duration_expr": true,
     "fill": false,
