@@ -87,6 +87,47 @@ func TestNormalizeForCSE_VectorMatchingOrder(t *testing.T) {
 	require.True(t, pa.Root.EquivalentTo(pb.Root), "expected different on()/group_left() order to be equivalent after normalization")
 }
 
+// TestNormalizeForCSE_MatcherTieBreak verifies that sortMatchers' secondary
+// (Type) and tertiary (Value) sort keys are exercised correctly, not just
+// its primary (Name) key: two matchers sharing the same label name but
+// differing in match type or value must still sort to a consistent,
+// order-independent result, since PromQL allows more than one matcher per
+// label name (e.g. a regex matcher combined with a negative equality
+// matcher on the same label).
+func TestNormalizeForCSE_MatcherTieBreak(t *testing.T) {
+	a := preprocess(t, `foo{job=~"a.*", job!="b"}`)
+	b := preprocess(t, `foo{job!="b", job=~"a.*"}`)
+
+	pa, err := plan.FromExpr(a)
+	require.NoError(t, err)
+	pb, err := plan.FromExpr(b)
+	require.NoError(t, err)
+
+	require.False(t, pa.Root.EquivalentTo(pb.Root), "expected same-name matchers with different match types in different order to differ before normalization")
+
+	plan.NormalizeForCSE(pa.Root)
+	plan.NormalizeForCSE(pb.Root)
+
+	require.True(t, pa.Root.EquivalentTo(pb.Root), "expected same-name matchers with different match types in different order to be equivalent after normalization")
+
+	// Same match type, same name, different value: still must tie-break
+	// consistently on Value so the two orderings converge.
+	c := preprocess(t, `foo{job=~"a.*", job=~"b.*"}`)
+	d := preprocess(t, `foo{job=~"b.*", job=~"a.*"}`)
+
+	pc, err := plan.FromExpr(c)
+	require.NoError(t, err)
+	pd, err := plan.FromExpr(d)
+	require.NoError(t, err)
+
+	require.False(t, pc.Root.EquivalentTo(pd.Root), "expected same-name same-type matchers with different values in different order to differ before normalization")
+
+	plan.NormalizeForCSE(pc.Root)
+	plan.NormalizeForCSE(pd.Root)
+
+	require.True(t, pc.Root.EquivalentTo(pd.Root), "expected same-name same-type matchers with different values in different order to be equivalent after normalization")
+}
+
 // TestNormalizeForCSE_DoesNotChangeShape verifies plan.NormalizeForCSE never adds,
 // removes, or reorders children: it only mutates type-specific fields in
 // place.

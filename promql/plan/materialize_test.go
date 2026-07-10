@@ -127,3 +127,10 @@ func TestStripDeduplicateAndMergeMarkers_RemovesEveryMarker(t *testing.T) {
 
 	require.Empty(t, findAll[*plan.DeduplicateAndMergeNode](stripped))
 }
+
+// TestStripDeduplicateAndMergeMarkers_NilRoot verifies the nil-root guard:
+// callers should be able to pass a nil plan (e.g. the result of a failed
+// upstream step propagated through) without a panic.
+func TestStripDeduplicateAndMergeMarkers_NilRoot(t *testing.T) {
+	require.Nil(t, plan.StripDeduplicateAndMergeMarkers(nil))
+}
