@@ -178,28 +178,118 @@ sensitive that crossover point is to A's absolute cardinality. That
 crossover point is the concrete evidence needed to answer §4's heuristic
 question, rather than guessing at a static rule.
 
+## §6 results: the benchmark, run
+
+`promql/subsetselector_bench_test.go` (`BenchmarkSubsetSelectorCandidate`)
+implements §6's proposal directly, operating on a `storage.Querier` (there is
+no `FilteredSelectorNode` to integrate into a plan; this is the hand-rolled
+prototype §6 asks for). For A = `{__name__="sse_test", job="x"}` and B = A
+plus one residual matcher, at three cardinalities of A (100, 1,000, 10,000
+series) and three ratios of B's cardinality to A's (0.50, 0.10, 0.01), it
+compares `unshared` (independent `Select(A)` and `Select(B)`, each fully
+decoded) against `shared_prototype` (`Select(A)` once, fully decoded, then B
+derived by checking the residual matcher against A's already-decoded series
+in memory).
+
+Measured on this machine (Apple M4 Pro, `-benchtime=20x -count=3`, median of
+the three; absolute numbers will vary by hardware, the crossover behavior
+between columns is what matters):
+
+| \|A\| | ratio | unshared | shared\_prototype | shared ÷ unshared |
+|---|---|---|---|---|
+| 100    | 0.50 | 0.369ms | 0.251ms |  0.68× |
+| 100    | 0.10 | 0.214ms | 0.216ms |  1.01× |
+| 100    | 0.01 | 0.191ms | 0.207ms |  1.08× |
+| 1,000  | 0.50 | 2.930ms | 2.283ms |  0.78× |
+| 1,000  | 0.10 | 2.064ms | 2.222ms |  1.08× |
+| 1,000  | 0.01 | 1.908ms | 2.250ms |  1.18× |
+| 10,000 | 0.50 | 29.36ms | 23.08ms |  0.79× |
+| 10,000 | 0.10 | 21.23ms | 23.09ms |  1.09× |
+| 10,000 | 0.01 | 19.45ms | 23.02ms |  1.18× |
+
+Two things fall out of this, both confirming §4's concern rather than
+resolving it in SSE's favor:
+
+1. **`shared_prototype`'s cost is nearly flat across ratio, at fixed
+   `|A|`.** 2.22-2.33ms across all three ratios at `|A|=1,000`,
+   23.0-23.1ms at `|A|=10,000`. This is exactly what §3 predicts: the cost
+   is dominated by fully materializing A (index walk plus chunk decode for
+   every one of A's series), which does not shrink no matter how selective
+   B's residual matcher is. The in-memory filter step itself is cheap
+   enough not to show up.
+2. **`unshared`'s cost scales down with ratio, and crosses under
+   `shared_prototype` between ratio 0.5 and 0.1 at every cardinality
+   tested.** Interpolating linearly between the ratio=0.5 and ratio=0.1
+   measurements for where `unshared` equals `shared_prototype`'s
+   (roughly-constant) cost gives a crossover ratio of ~0.12 (`|A|=100`),
+   ~0.21 (`|A|=1,000`), ~0.19 (`|A|=10,000`). Below that ratio, B is cheap
+   enough to select directly that materializing all of A to serve it is a
+   net loss; above it, sharing wins.
+
+This reproduces §4's stated failure mode empirically, not just
+structurally: sharing is a win only when B is not much more selective than
+A (roughly ratio ≳ 0.2 in this fixture), and a regression otherwise. The
+crossover ratio is reasonably stable across a 100× cardinality range
+(0.12-0.21), which is more encouraging than "no signal exists" — it
+suggests a ratio-based heuristic could work in principle — but the ratio
+that matters (B's cardinality ÷ A's cardinality) is exactly the
+cardinality signal §4 already noted Prometheus's engine does not compute
+before running a query. Nothing in this benchmark demonstrates a way to
+know that ratio in advance from selector shape alone (matcher count,
+metric name, etc.): a `{job="a"}` vs `{job="a",env="prod"}` pair could
+realize any ratio from near-0 to near-1 depending on the data, and this
+benchmark's ratios were set by construction, not inferred from the
+matchers. That gap is the same one §4's "static heuristic vs. skip the
+decision entirely" choice already identified, now with a number attached
+(~0.2) for what the heuristic would need to threshold on, if a proxy for
+it existed.
+
+A secondary finding worth flagging for §3's design, independent of the
+ratio question: `shared_prototype` allocates roughly 13-14× the memory of
+`unshared` at the same cardinality (e.g. 45.5MB vs 3.1MB at
+`|A|=10,000, ratio=0.5`), because this prototype decodes every sample into
+a `[]fSample` per series rather than reusing buffers. A real
+`FilteredSelectorNode` would need CSE's `materialize.go` discipline (reuse
+iterators/slices, document non-retention for callers) to avoid trading
+query latency for GC pressure even in the ratio range where it wins on
+time; this benchmark does not attempt that optimization; it measures the
+naive case as a upper bound on the memory cost, not a lower one.
+
 ## Recommendation
 
 Do not build `FilteredSelectorNode` or wire subsumption-based sharing into
-`promql/engine.go` yet. Unlike CSE (a strict, unconditional win: identical
-work computed once instead of twice) and unlike `MultiAggregation`
-(marginal, but never negative), SSE is a pass that can regress query
-performance for shapes it misjudges, and there is currently no cardinality
-signal in Prometheus's engine to make that judgment reliably. §6's
-benchmark is the prerequisite for finding out whether a heuristic exists
-that makes the win reliably positive, and for characterizing whether
-`PropagateMatchers` (§5) already captures most of the available benefit
-without this pass at all.
+`promql/engine.go` yet, and the benchmark in §6 sharpens rather than
+resolves the concern §4 raised: `shared_prototype` regresses `unshared` at
+ratio 0.1 and 0.01 in every cardinality tested, and only wins at ratio 0.5.
+Unlike CSE (a strict, unconditional win: identical work computed once
+instead of twice) and unlike `MultiAggregation` (marginal, but never
+negative), SSE is confirmed here, empirically, to be a pass that regresses
+query performance for a large fraction of the shapes it would apply to
+(anything where B is meaningfully more selective than A), and there is
+still no cardinality-ratio signal in Prometheus's engine to distinguish
+those shapes from the ~0.2-and-above ratio range where it helps. Building
+`FilteredSelectorNode` today would mean shipping a pass with no reliable
+way to gate it, which does not match this project's "prove it doesn't
+regress common cases" bar. §5's overlap with `PropagateMatchers` (already
+landed) further narrows whatever slice of cases would remain worth
+capturing even if a ratio signal existed.
 
 ## Open questions
 
 1. Is v1 scope (exact-matcher-superset containment, no regex reasoning)
    worth building at all, or does §5's overlap with `PropagateMatchers`
-   already close most of the gap it would fill?
-2. Does §6's benchmark find a heuristic (static, based on selector shape
-   alone) that reliably predicts when sharing helps vs. regresses, or does
-   this fundamentally require a cardinality estimate Prometheus's engine
-   does not compute today?
+   already close most of the gap it would fill? Unresolved by §6's
+   benchmark, which measures the sharing mechanism's cost profile, not how
+   often qualifying selector pairs actually occur in real queries once
+   `PropagateMatchers` has already run.
+2. §6's benchmark finds the win is ratio-dependent with a crossover around
+   0.12-0.21 (stable across a 100× cardinality range), but does not find a
+   way to predict that ratio from selector shape alone (matcher count,
+   metric name, matcher values) ahead of running the query. Answering this
+   fully requires either a cardinality-estimation capability Prometheus's
+   engine does not have today, or evidence that some cheap proxy (e.g.
+   same-`Name` selectors reliably falling above or below the crossover)
+   correlates with the ratio well enough to gate on.
 3. Should this extend to `MatrixSelectorNode`/range selectors, or is
    vector-selector-only a reasonable v1 boundary (mirroring how CSE itself
    started narrower, e.g. `hasUnstableOffset`'s conservative
