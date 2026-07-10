@@ -1394,6 +1394,31 @@ func cloneSharedValue(v parser.Value) parser.Value {
 // those interleave, as long as every eligible occurrence's owning call site
 // performs exactly one release attempt for that occurrence — see this
 // file's pool-release call sites in rangeEval and rangeEvalAgg.
+//
+// Known limitation, found by adversarial review rather than assumed away:
+// "exactly one release attempt per eligible occurrence" does not hold for a
+// node whose closest shared ancestor is itself also a tracked shared node.
+// Once that ancestor's second (and later) occurrence is served from
+// ev.sharedResults, eval never redescends into the ancestor's own children
+// to re-derive their arguments — so a descendant that plan.MaterializeSharing
+// also gave its own >1 refcount (e.g. rate(foo[5m]) used twice: the
+// CallNode, the MatrixSelectorNode, and the VectorSelectorNode are all
+// independently tracked) only ever receives ONE real release attempt in
+// practice, not the count recorded for it. The counter here then never
+// reaches zero for that descendant, so its pooled point slices are simply
+// never returned to the pool for that query — a missed-reuse regression,
+// not a correctness bug: nothing is double-released, no wrong result is
+// possible, and Go's garbage collector still reclaims the memory once the
+// query's evaluator is no longer referenced. This is the same category of
+// deliberate, documented tradeoff docs/query-planner-phase2-design.md §4
+// already accepts for Strategy A's memory profile in the single-level
+// case; the multi-level case simply was not caught before landing, and a
+// correct general fix (computing each node's true expected release count
+// from how many of its ancestors are themselves genuinely re-evaluated,
+// not merely how many textual occurrences existed pre-CSE) is real,
+// nontrivial work deliberately deferred rather than rushed alongside this
+// comment, to avoid trading a safe, understood inefficiency for a rushed
+// change to the trickiest part of this mechanism.
 func (ev *evaluator) shouldReleaseSharedNode(expr parser.Expr) bool {
 	if len(ev.sharedNodeRefcount) == 0 {
 		return true
@@ -1651,6 +1676,35 @@ func (enh *EvalNodeHelper) getOrCreateLblsWithQuantile(lbls labels.Labels, quant
 	return cachedLblsWithQuantile
 }
 
+// releaseOrigMatrixes returns each of origMatrixes' point slices to
+// fPointPool/hPointPool, unless the corresponding entry in exprs is a
+// shared node another eligible occurrence still needs to read (see
+// shouldReleaseSharedNode). origMatrixes[i] corresponds 1:1 to exprs[i]; a
+// nil or string-typed exprs[i] was never populated by rangeEval's own
+// gather loop, so origMatrixes[i] is empty and this is a no-op for it
+// regardless of what shouldReleaseSharedNode(nil) returns (always true:
+// nil is never a key of ev.sharedNodeRefcount).
+//
+// Callers must invoke this on every return path that has already built
+// origMatrixes, including early-return shortcuts: skipping it does not
+// cause a wrong result or a double-release (shouldReleaseSharedNode's own
+// per-expr counter simply never reaches zero for a node whose release
+// attempt is skipped this way), but it does mean that node's pooled point
+// slices are never returned to the pool for this query — a missed-reuse
+// regression, not a correctness bug, since Go's garbage collector still
+// reclaims the memory once nothing references it anymore.
+func (ev *evaluator) releaseOrigMatrixes(exprs []parser.Expr, origMatrixes []Matrix) {
+	for i, m := range origMatrixes {
+		if !ev.shouldReleaseSharedNode(exprs[i]) {
+			continue
+		}
+		for _, s := range m {
+			putFPointSlice(s.Floats)
+			putHPointSlice(s.Histograms)
+		}
+	}
+}
+
 // rangeEval evaluates the given expressions, and then for each step calls
 // the given funcCall with the values computed for each expression at that
 // step. The return value is the combination into time series of all the
@@ -1797,6 +1851,15 @@ func (ev *evaluator) rangeEval(ctx context.Context, matching *parser.VectorMatch
 					mat[i] = Series{Metric: s.Metric, Histograms: []HPoint{{T: ts, H: s.H}}, DropName: s.DropName}
 				}
 			}
+			// This shortcut returns before the general release loop below,
+			// which would otherwise never run for an instant query: without
+			// this call, a shared node's shouldReleaseSharedNode release
+			// attempt is simply never made on this path, so its pooled
+			// point slices are never returned to fPointPool/hPointPool for
+			// this query (a missed-reuse regression, not a correctness bug
+			// — Go's GC still reclaims the memory once it's unreferenced;
+			// see releaseOrigMatrixes' doc).
+			ev.releaseOrigMatrixes(exprs, origMatrixes)
 			ev.currentSamples = originalNumSamples + mat.TotalSamples()
 			ev.samplesStats.UpdatePeak(ev.currentSamples)
 			return mat, warnings
@@ -1820,22 +1883,8 @@ func (ev *evaluator) rangeEval(ctx context.Context, matching *parser.VectorMatch
 	}
 
 	// Reuse the original point slices, unless the corresponding expr is a
-	// shared node another eligible occurrence still needs to read. Each
-	// origMatrixes[i] corresponds 1:1 to exprs[i] (both were built by
-	// len(exprs)-length allocations above); a nil or string-typed exprs[i]
-	// was never populated by the gather loop above, so origMatrixes[i] is
-	// empty and this loop is a no-op for it regardless of what
-	// shouldReleaseSharedNode(nil) returns (always true: nil is never a key
-	// of ev.sharedNodeRefcount).
-	for i, m := range origMatrixes {
-		if !ev.shouldReleaseSharedNode(exprs[i]) {
-			continue
-		}
-		for _, s := range m {
-			putFPointSlice(s.Floats)
-			putHPointSlice(s.Histograms)
-		}
-	}
+	// shared node another eligible occurrence still needs to read.
+	ev.releaseOrigMatrixes(exprs, origMatrixes)
 	// Assemble the output matrix. By the time we get here we know we don't have too many samples.
 	mat := make(Matrix, 0, len(seriess))
 	for _, ss := range seriess {

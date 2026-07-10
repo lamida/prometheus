@@ -86,6 +86,53 @@ func TestCommonSubexpressionElimination_BasicDuplicateSubtree(t *testing.T) {
 	require.Equal(t, 5, merged, "expected exactly one merge per level of the shared chain")
 }
 
+// TestCommonSubexpressionElimination_ParentCountNotInflatedBelowSharedRoot is
+// a regression test: canonicalize used to leave every node strictly beneath
+// the top of a merged, multi-level-deep duplicate chain with a ParentCount
+// one higher than reality. The bug was in the order of operations in
+// canonicalize (cse.go): a node's own children are canonicalized and
+// ReplaceChild'd (which increments their ParentCount to account for the
+// edge from this node) BEFORE this node itself is checked against its
+// bucket for being a duplicate. If this node then turns out to be a
+// duplicate and is discarded in favor of an existing canonical survivor,
+// nothing undid the ParentCount increments those ReplaceChild calls just
+// made — so every child of a discarded node kept one permanent phantom
+// parent, even though the discarded node itself is unreachable after
+// merging and contributes no real edge to anything.
+//
+// "sum(rate(foo[5m])) / sum(rate(foo[5m]))" has a 5-level-deep shared chain
+// (AggregateExpr -> DeduplicateAndMerge -> Call -> MatrixSelector ->
+// VectorSelector, see TestCommonSubexpressionElimination_BasicDuplicateSubtree).
+// Only the topmost node of that chain (the AggregateExprNode, reachable
+// from both sides of the outer BinaryExprNode) genuinely has two parents
+// after merging; every node below it in the now-singular chain has exactly
+// one real parent (the node directly above it), and ParentCount() must
+// reflect that, not the inflated value the bug produced.
+func TestCommonSubexpressionElimination_ParentCountNotInflatedBelowSharedRoot(t *testing.T) {
+	root := buildAndPrepare(t, "sum(rate(foo[5m])) / sum(rate(foo[5m]))")
+
+	newRoot, merged := plan.CommonSubexpressionElimination(root)
+	require.Equal(t, 5, merged, "expected exactly one merge per level of the shared chain")
+
+	be, ok := newRoot.(*plan.BinaryExprNode)
+	require.True(t, ok, "expected *plan.BinaryExprNode root after CSE, got %T", newRoot)
+	require.Same(t, be.Child(0), be.Child(1), "expected both sides to share one node after CSE")
+	require.Equal(t, 2, be.Child(0).ParentCount(), "expected the top of the shared chain to have exactly 2 parents")
+
+	for _, n := range findAll[*plan.DeduplicateAndMergeNode](newRoot) {
+		require.Equal(t, 1, n.ParentCount(), "expected the shared chain's DeduplicateAndMergeNode to have exactly 1 parent, not an inflated count")
+	}
+	for _, n := range findAll[*plan.CallNode](newRoot) {
+		require.Equal(t, 1, n.ParentCount(), "expected the shared chain's rate() CallNode to have exactly 1 parent, not an inflated count")
+	}
+	for _, n := range findAll[*plan.MatrixSelectorNode](newRoot) {
+		require.Equal(t, 1, n.ParentCount(), "expected the shared chain's MatrixSelectorNode to have exactly 1 parent, not an inflated count")
+	}
+	for _, n := range findAll[*plan.VectorSelectorNode](newRoot) {
+		require.Equal(t, 1, n.ParentCount(), "expected the shared chain's VectorSelectorNode to have exactly 1 parent, not an inflated count")
+	}
+}
+
 // TestCommonSubexpressionElimination_SharedLeafUnderDifferentParents covers
 // merging a duplicated leaf subexpression that sits under otherwise
 // different parents: abs(foo) and ceil(foo) don't merge themselves, but

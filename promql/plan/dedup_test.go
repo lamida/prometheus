@@ -96,6 +96,16 @@ func TestFromExpr_DeduplicateAndMergeInsertion(t *testing.T) {
 			query:    "sort(foo)",
 			wantWrap: false,
 		},
+		{
+			name:     "scalar-returning function call is never wrapped",
+			query:    "scalar(foo)",
+			wantWrap: false,
+		},
+		{
+			name:     "time() is never wrapped",
+			query:    "time()",
+			wantWrap: false,
+		},
 	}
 
 	for _, tc := range tests {
@@ -189,6 +199,19 @@ func TestEliminateDeduplicateAndMerge(t *testing.T) {
 			// eliminable once foo's exact name matcher is established.
 			name:                   "nested non-label-modifying calls are eliminated",
 			query:                  "abs(rate(foo[5m]))",
+			wantEliminatedNonDelay: true,
+			wantEliminatedDelay:    true,
+		},
+		{
+			// Exercises canEliminateDeduplicateAndMerge's SubqueryExprNode
+			// case: the unary minus wraps min_over_time(...), whose sole
+			// argument is a SubqueryExprNode wrapping rate(foo[5m]). Every
+			// link in that chain (unary minus of a vector -> non-label-
+			// modifying call -> subquery -> non-label-modifying call over a
+			// selector with an exact name matcher) is provably unique, so
+			// this is eliminated in both modes.
+			name:                   "unary minus of a call over a subquery is eliminated",
+			query:                  "-min_over_time(rate(foo[5m])[10m:1m])",
 			wantEliminatedNonDelay: true,
 			wantEliminatedDelay:    true,
 		},
