@@ -112,6 +112,20 @@ func (c *cseCanonicalizer) canonicalize(n Node) Node {
 					candHolder.addOccurrences(holder.occurrenceRecords())
 				}
 			}
+			// n's own edges to its children (established by the
+			// ReplaceChild/canonicalize calls above, before n itself was
+			// known to be a duplicate) must be released now that n is
+			// unreachable: n.Child(i) == cand.Child(i) for every i (that's
+			// exactly what cseNodesEqual just verified), so cand's own
+			// edge to that same child already accounts for it, and n's
+			// edge is a dangling reference that would otherwise leave
+			// every child of a merged-away node with one permanent
+			// phantom ParentCount — never decremented, since n itself is
+			// simply dropped here rather than going through SetChildren
+			// or ReplaceChild on the way out.
+			for i := 0; i < n.ChildCount(); i++ {
+				decrementParents(n.Child(i))
+			}
 			return cand
 		}
 	}
