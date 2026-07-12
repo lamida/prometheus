@@ -1429,6 +1429,28 @@ type evaluator struct {
 	// (see occurrenceRecord.ineligibleForSharing), so a nested evaluator is
 	// guaranteed to never need to consult it.
 	subsetSource map[parser.Expr]parser.Expr
+
+	// sharedOrigMatrix holds, for every parser.Expr key in
+	// sharedNodeRefcount, the exact Matrix evalUncached returned the one
+	// time it actually computed that expr (populated by eval, the first
+	// time it is called for that key). It exists so that
+	// releaseSharedNode can always return the FULL set of pooled point
+	// slices a shared node owns, regardless of which occurrence's release
+	// attempt happens to be the one that finally exhausts
+	// sharedReleaseRemaining.
+	//
+	// This matters specifically for a Subset Selector Elimination
+	// dependent (see subsetSource): evalSubsetSelector's own return value
+	// is a Matrix containing only the source's series that also match the
+	// dependent's own LabelMatchers — a subset of the source's full
+	// result. If releasing used that locally filtered matrix instead of
+	// the source's full one, whichever of the source's series the
+	// dependent's matchers happened to exclude would never be returned to
+	// the pool — a real, silent leak, not just the "missed reuse" class of
+	// issue documented on shouldReleaseSharedNode. Consulting
+	// sharedOrigMatrix instead of the local matrix at release time avoids
+	// that. It is nil for a query with no shared/subset nodes at all.
+	sharedOrigMatrix map[parser.Expr]Matrix
 }
 
 // cachedResult holds eval's memoized return value for one shared
@@ -1551,6 +1573,44 @@ func (ev *evaluator) shouldReleaseSharedNode(expr parser.Expr) bool {
 	}
 	delete(ev.sharedReleaseRemaining, expr)
 	return true
+}
+
+// releaseSharedNode returns m's point slices to the pool, unless expr is a
+// shared node (or a Subset-Selector-Elimination dependent of one) another
+// eligible occurrence still needs to read (see shouldReleaseSharedNode).
+//
+// When release is due for a tracked expr, this releases
+// ev.sharedOrigMatrix's entry for that node's canonical source instead of
+// the caller-supplied m: m is only the local matrix the CALLER's own
+// occurrence produced, which for a subset-derived dependent is the
+// narrower, filtered view evalSubsetSelector returned — releasing that
+// instead of the source's full matrix would leak whichever of the
+// source's series the dependent's own matchers excluded. m is used as a
+// fallback for the common, non-shared case (sharedOrigMatrix has no entry
+// for expr), which keeps this a no-op beyond one map lookup for the
+// overwhelming majority of calls.
+func (ev *evaluator) releaseSharedNode(expr parser.Expr, m Matrix) {
+	if !ev.shouldReleaseSharedNode(expr) {
+		return
+	}
+	if len(ev.sharedOrigMatrix) > 0 {
+		canonical := expr
+		for {
+			src, ok := ev.subsetSource[canonical]
+			if !ok {
+				break
+			}
+			canonical = src
+		}
+		if orig, ok := ev.sharedOrigMatrix[canonical]; ok {
+			delete(ev.sharedOrigMatrix, canonical)
+			m = orig
+		}
+	}
+	for _, s := range m {
+		putFPointSlice(s.Floats)
+		putHPointSlice(s.Histograms)
+	}
 }
 
 // errorf causes a panic with the input formatted into an error.
@@ -1805,13 +1865,7 @@ func (enh *EvalNodeHelper) getOrCreateLblsWithQuantile(lbls labels.Labels, quant
 // reclaims the memory once nothing references it anymore.
 func (ev *evaluator) releaseOrigMatrixes(exprs []parser.Expr, origMatrixes []Matrix) {
 	for i, m := range origMatrixes {
-		if !ev.shouldReleaseSharedNode(exprs[i]) {
-			continue
-		}
-		for _, s := range m {
-			putFPointSlice(s.Floats)
-			putHPointSlice(s.Histograms)
-		}
+		ev.releaseSharedNode(exprs[i], m)
 	}
 }
 
@@ -2011,13 +2065,7 @@ func (ev *evaluator) rangeEvalAgg(ctx context.Context, aggExpr *parser.Aggregate
 	// occurrence still needs to read (see shouldReleaseSharedNode).
 	origMatrix := slices.Clone(inputMatrix)
 	defer func() {
-		if !ev.shouldReleaseSharedNode(aggExpr.Expr) {
-			return
-		}
-		for _, s := range origMatrix {
-			putFPointSlice(s.Floats)
-			putHPointSlice(s.Histograms)
-		}
+		ev.releaseSharedNode(aggExpr.Expr, origMatrix)
 	}()
 
 	var annos annotations.Annotations
@@ -2567,6 +2615,16 @@ func (ev *evaluator) eval(ctx context.Context, expr parser.Expr) (parser.Value, 
 	if remaining := total - 1; remaining > 0 {
 		ev.sharedResults[expr] = cachedResult{val: val, ws: ws}
 		ev.sharedVisitsRemaining[expr] = remaining
+	}
+	// Retain the full, uncloned Matrix for releaseSharedNode, so a
+	// Subset-Selector-Elimination dependent's redirected release (see
+	// sharedOrigMatrix's doc) always frees the source's complete point
+	// slices, not just the locally filtered view that occurrence computed.
+	if mat, ok := val.(Matrix); ok {
+		if ev.sharedOrigMatrix == nil {
+			ev.sharedOrigMatrix = make(map[parser.Expr]Matrix, len(ev.sharedNodeRefcount))
+		}
+		ev.sharedOrigMatrix[expr] = mat
 	}
 	return cloneSharedValue(val), ws
 }
