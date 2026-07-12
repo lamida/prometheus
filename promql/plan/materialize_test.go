@@ -111,6 +111,58 @@ func TestMaterializeSharing_StepInvariantBoundaryNeverAliased(t *testing.T) {
 	require.Empty(t, refcounts, "an @-pinned occurrence must never be materialized, even if the other side is otherwise identical")
 }
 
+// buildMaterializeSubsetPlan mirrors buildMaterializePlan, additionally
+// running plan.SubsetSelectorElimination — the prerequisite
+// plan.MaterializeSubsetSharing expects (see its doc).
+func buildMaterializeSubsetPlan(t *testing.T, query string) (plan.Node, parser.Expr) {
+	t.Helper()
+	root, expr := buildMaterializePlan(t, query)
+	plan.SubsetSelectorElimination(root)
+	return root, expr
+}
+
+// TestMaterializeSubsetSharing_BasicSubsumption covers the direct case: a
+// subsumed selector's real *parser.VectorSelector should map to its source's
+// real *parser.VectorSelector, without touching the real tree itself (unlike
+// plan.MaterializeSharing, this never aliases pointers — see
+// plan.MaterializeSubsetSharing's doc).
+func TestMaterializeSubsetSharing_BasicSubsumption(t *testing.T) {
+	root, expr := buildMaterializeSubsetPlan(t, `up{job="a"} + up{job="a",env="prod"}`)
+
+	be, ok := expr.(*parser.BinaryExpr)
+	require.True(t, ok, "expected *parser.BinaryExpr, got %T", expr)
+	wide, ok := be.LHS.(*parser.VectorSelector)
+	require.True(t, ok)
+	narrow, ok := be.RHS.(*parser.VectorSelector)
+	require.True(t, ok)
+	require.Len(t, wide.LabelMatchers, 2)
+	require.Len(t, narrow.LabelMatchers, 3)
+
+	subsetSource := plan.MaterializeSubsetSharing(root)
+
+	require.Len(t, subsetSource, 1)
+	require.Same(t, wide, subsetSource[narrow], "expected the narrow selector's real expr to map to the wide selector's real expr")
+	require.NotSame(t, be.LHS, be.RHS, "unlike CSE, the real tree's two selectors must remain distinct objects")
+}
+
+func TestMaterializeSubsetSharing_NoSubsumption_EmptyMap(t *testing.T) {
+	root, _ := buildMaterializeSubsetPlan(t, `up{job="a"} + up{job="b"}`)
+
+	subsetSource := plan.MaterializeSubsetSharing(root)
+	require.Empty(t, subsetSource)
+}
+
+// TestMaterializeSubsetSharing_SubqueryBoundaryNeverMaterialized covers the
+// same exclusion plan.MaterializeSharing applies: a subsumed selector, or
+// its source, sitting only inside a subquery body must never be
+// materialized into the map.
+func TestMaterializeSubsetSharing_SubqueryBoundaryNeverMaterialized(t *testing.T) {
+	root, _ := buildMaterializeSubsetPlan(t, `up{job="a"} + sum_over_time(up{job="a",env="prod"}[10m:1m])`)
+
+	subsetSource := plan.MaterializeSubsetSharing(root)
+	require.Empty(t, subsetSource, "the only subsumed occurrence sits inside a subquery body and must be excluded")
+}
+
 func TestStripDeduplicateAndMergeMarkers_RemovesEveryMarker(t *testing.T) {
 	expr := preprocess(t, "foo or bar")
 	p, err := plan.FromExpr(expr)

@@ -356,6 +356,22 @@ type EngineOpts struct {
 	// docs/query-planner-phase2-design.md §4-§5 for the design.
 	EnableCommonSubexpressionElimination bool
 
+	// EnableSubsetSelectorElimination, if true, runs Subset Selector
+	// Elimination (SSE) over each top-level query's plan, after common
+	// subexpression elimination: when one selector's matchers are a strict
+	// superset of another's (so its result set is always a subset of the
+	// other's), the narrower selector's result is derived by filtering the
+	// wider selector's already-materialized result in memory instead of
+	// issuing its own storage.Querier.Select call. See
+	// docs/query-planner-phase4-design.md for the design, and its
+	// "Recommendation" section for the tradeoff this opts a query into:
+	// unlike CSE (a strict, unconditional win), this pass can regress a
+	// query below roughly a 0.12-0.21 subset-cardinality ratio (§6's
+	// benchmark), and there is currently no selector-shape signal to
+	// predict that ratio ahead of time. Disabled by default; enabling it
+	// means always sharing when the relation is found, accepting that risk.
+	EnableSubsetSelectorElimination bool
+
 	// FeatureRegistry is the registry for tracking enabled/disabled features.
 	FeatureRegistry features.Collector
 
@@ -385,6 +401,7 @@ type Engine struct {
 	optimizePipeline         *optimize.Pipeline
 
 	enableCommonSubexpressionElimination bool
+	enableSubsetSelectorElimination      bool
 }
 
 // NewEngine returns a new engine.
@@ -501,6 +518,7 @@ func NewEngine(opts EngineOpts) *Engine {
 		r.Set(features.PromQL, "type_and_unit_labels", opts.EnableTypeAndUnitLabels)
 		r.Set(features.PromQL, "optimization_passes", opts.EnableOptimizationPasses)
 		r.Set(features.PromQL, "common_subexpression_elimination", opts.EnableCommonSubexpressionElimination)
+		r.Set(features.PromQL, "subset_selector_elimination", opts.EnableSubsetSelectorElimination)
 		r.Enable(features.PromQL, "per_query_lookback_delta")
 		r.Enable(features.PromQL, "subqueries")
 
@@ -532,6 +550,7 @@ func NewEngine(opts EngineOpts) *Engine {
 		parser:                   opts.Parser,
 
 		enableCommonSubexpressionElimination: opts.EnableCommonSubexpressionElimination,
+		enableSubsetSelectorElimination:      opts.EnableSubsetSelectorElimination,
 	}
 }
 
@@ -841,14 +860,18 @@ func (ng *Engine) execEvalStmt(ctx context.Context, query *query, s *parser.Eval
 	// w.r.t. the start time since only 1 evaluation will be done on them.
 	setOffsetForAtModifier(timeMilliseconds(s.Start), s.Expr)
 
-	// Common-subexpression elimination is a pure optimization: it must
-	// never fail the query, so any error building/materializing the plan is
-	// swallowed here and the query falls through to today's unmodified,
-	// un-shared evaluation. See EngineOpts.EnableCommonSubexpressionElimination's
-	// doc and docs/query-planner-phase2-design.md §5.
+	// Common-subexpression elimination and Subset Selector Elimination are
+	// both pure optimizations: they must never fail the query, so any error
+	// building/materializing the plan is swallowed here and the query falls
+	// through to today's unmodified, un-shared evaluation. See
+	// EngineOpts.EnableCommonSubexpressionElimination's and
+	// EngineOpts.EnableSubsetSelectorElimination's docs,
+	// docs/query-planner-phase2-design.md §5, and
+	// docs/query-planner-phase4-design.md.
 	var sharedNodeRefcount map[parser.Expr]int
-	if ng.enableCommonSubexpressionElimination {
-		sharedNodeRefcount = ng.materializeSharedSubexpressions(s.Expr)
+	var subsetSource map[parser.Expr]parser.Expr
+	if ng.enableCommonSubexpressionElimination || ng.enableSubsetSelectorElimination {
+		sharedNodeRefcount, subsetSource = ng.materializePlanOptimizations(s.Expr)
 	}
 
 	evalSpanTimer, ctxInnerEval := query.stats.GetSpanTimer(ctx, stats.InnerEvalTime, ng.metrics.queryInnerEval, ng.metrics.queryInnerEvalHistogram)
@@ -869,6 +892,7 @@ func (ng *Engine) execEvalStmt(ctx context.Context, query *query, s *parser.Eval
 			useStartTimestamps:       ng.useStartTimestamps,
 			querier:                  querier,
 			sharedNodeRefcount:       sharedNodeRefcount,
+			subsetSource:             subsetSource,
 		}
 		if len(sharedNodeRefcount) > 0 {
 			evaluator.sharedResults = make(map[parser.Expr]cachedResult, len(sharedNodeRefcount))
@@ -935,6 +959,7 @@ func (ng *Engine) execEvalStmt(ctx context.Context, query *query, s *parser.Eval
 		useStartTimestamps:       ng.useStartTimestamps,
 		querier:                  querier,
 		sharedNodeRefcount:       sharedNodeRefcount,
+		subsetSource:             subsetSource,
 	}
 	if len(sharedNodeRefcount) > 0 {
 		evaluator.sharedResults = make(map[parser.Expr]cachedResult, len(sharedNodeRefcount))
@@ -983,11 +1008,42 @@ func (ng *Engine) execEvalStmt(ctx context.Context, query *query, s *parser.Eval
 // plan.FromExpr does not yet handle) is logged at Debug level, if a logger
 // is available, and this simply returns nil — the caller then evaluates
 // expr exactly as it would with the feature disabled.
-func (ng *Engine) materializeSharedSubexpressions(expr parser.Expr) map[parser.Expr]int {
+// materializePlanOptimizations builds a promql/plan query plan for expr
+// once and runs whichever of common-subexpression elimination (CSE) and
+// Subset Selector Elimination (SSE) ng is configured for over it,
+// materializing any sharing either finds back onto expr's own real
+// parser.Expr tree (mutating it in place for CSE — see
+// plan.MaterializeSharing's doc — but never for SSE, which returns a
+// side-table instead — see plan.MaterializeSubsetSharing's doc). It returns
+// the CSE refcount table and the SSE subset-source table for use by the
+// evaluator(s) that will evaluate expr; either may be nil if the
+// corresponding feature is disabled, its plan pass found nothing, or the
+// plan could not be built.
+//
+// SSE always runs after CSE on the same (possibly CSE-canonicalized) root
+// when both are enabled, per docs/query-planner-phase4-design.md §2: it
+// only needs to consider the already-deduplicated selector set. Every
+// selector serving as another's subset source has its CSE refcount bumped
+// by one per dependent (in addition to its own natural occurrence count, or
+// whatever real CSE duplication already gave it), since eval() will consult
+// it one extra time per dependent — see evaluator.subsetSource's doc.
+//
+// This must be called after setOffsetForAtModifier (see execEvalStmt's call
+// site): plan.FromExpr relies on every selector's .Offset field already
+// being resolved, which only setOffsetForAtModifier computes (see
+// plan.FromExpr's doc comment).
+//
+// Building or materializing a plan never fails the query: both passes are
+// pure optimizations on top of behavior that must remain correct with or
+// without them, so any error (e.g. an expr shape plan.FromExpr does not yet
+// handle) is logged at Debug level, if a logger is available, and this
+// simply returns nil, nil — the caller then evaluates expr exactly as it
+// would with both features disabled.
+func (ng *Engine) materializePlanOptimizations(expr parser.Expr) (map[parser.Expr]int, map[parser.Expr]parser.Expr) {
 	defer func() {
-		// A bug in this optimization must never turn into a failed query or,
-		// worse, a silently wrong result: if building or materializing the
-		// plan panics for any reason, swallow it and fall back to
+		// A bug in either optimization must never turn into a failed query
+		// or, worse, a silently wrong result: if building or materializing
+		// the plan panics for any reason, swallow it and fall back to
 		// unoptimized evaluation of the original (by then possibly
 		// partially, but not incorrectly, rewritten — see
 		// plan.MaterializeSharing's doc: every mutation it performs replaces
@@ -995,28 +1051,54 @@ func (ng *Engine) materializeSharedSubexpressions(expr parser.Expr) map[parser.E
 		// so a partial run is never observably different from a full one)
 		// expr tree.
 		if r := recover(); r != nil && ng.logger != nil {
-			ng.logger.Debug("common subexpression elimination panicked; evaluating without it", "err", r)
+			ng.logger.Debug("query plan optimization panicked; evaluating without it", "err", r)
 		}
 	}()
 
 	p, err := plan.FromExpr(expr)
 	if err != nil {
 		if ng.logger != nil {
-			ng.logger.Debug("plan.FromExpr failed; evaluating without common subexpression elimination", "err", err)
+			ng.logger.Debug("plan.FromExpr failed; evaluating without query plan optimizations", "err", err)
 		}
-		return nil
+		return nil, nil
 	}
 	root := plan.StripDeduplicateAndMergeMarkers(p.Root)
 	plan.NormalizeForCSE(root)
-	root, merged := plan.CommonSubexpressionElimination(root)
-	if merged == 0 {
-		return nil
+
+	var refcounts map[parser.Expr]int
+	if ng.enableCommonSubexpressionElimination {
+		var merged int
+		root, merged = plan.CommonSubexpressionElimination(root)
+		if merged > 0 {
+			refcounts = plan.MaterializeSharing(root)
+		}
 	}
-	refcounts := plan.MaterializeSharing(root)
+
+	var subsetSource map[parser.Expr]parser.Expr
+	if ng.enableSubsetSelectorElimination {
+		if found := plan.SubsetSelectorElimination(root); found > 0 {
+			subsetSource = plan.MaterializeSubsetSharing(root)
+		}
+	}
+
+	if len(subsetSource) > 0 {
+		if refcounts == nil {
+			refcounts = make(map[parser.Expr]int, len(subsetSource))
+		}
+		for _, source := range subsetSource {
+			if _, tracked := refcounts[source]; !tracked {
+				refcounts[source] = 1 // Its own natural occurrence.
+			}
+			refcounts[source]++
+		}
+	}
 	if len(refcounts) == 0 {
-		return nil
+		refcounts = nil
 	}
-	return refcounts
+	if len(subsetSource) == 0 {
+		subsetSource = nil
+	}
+	return refcounts, subsetSource
 }
 
 func (ng *Engine) sortMatrixResult(ctx context.Context, query *query, mat Matrix) {
@@ -1325,6 +1407,28 @@ type evaluator struct {
 	// slices to the pool. It is initialized lazily, on first use, by
 	// shouldReleaseSharedNode.
 	sharedReleaseRemaining map[parser.Expr]int
+
+	// subsetSource implements Subset Selector Elimination
+	// (EngineOpts.EnableSubsetSelectorElimination): it maps a
+	// *parser.VectorSelector whose matchers were found to be a strict
+	// superset of another selector's (see
+	// docs/query-planner-phase4-design.md §1) to that other, narrower
+	// selector's real *parser.VectorSelector. evalUncached's
+	// *parser.VectorSelector case consults this map before doing its own
+	// storage selection: if present, the selector's result is derived by
+	// evaluating the mapped source (via eval, reusing
+	// sharedNodeRefcount/sharedResults so a source consulted by more than
+	// one dependent is still only computed once) and filtering the source's
+	// result by this selector's own LabelMatchers, rather than expanding its
+	// own UnexpandedSeriesSet. It is nil (the common case) for a query the
+	// feature is disabled for, or for which no subsumption was found. Like
+	// sharedNodeRefcount, it is deliberately left nil on any nested
+	// *evaluator this evaluator constructs (*parser.StepInvariantExpr's
+	// newEv, runSubquery's newEv): plan.MaterializeSubsetSharing never
+	// produces an entry for an occurrence sitting under either boundary
+	// (see occurrenceRecord.ineligibleForSharing), so a nested evaluator is
+	// guaranteed to never need to consult it.
+	subsetSource map[parser.Expr]parser.Expr
 }
 
 // cachedResult holds eval's memoized return value for one shared
@@ -1420,6 +1524,12 @@ func cloneSharedValue(v parser.Value) parser.Value {
 // comment, to avoid trading a safe, understood inefficiency for a rushed
 // change to the trickiest part of this mechanism.
 func (ev *evaluator) shouldReleaseSharedNode(expr parser.Expr) bool {
+	// A subset-derived selector's result shares its source's backing point
+	// slices (see evalSubsetSelector's doc): redirect its release attempt to
+	// the source, which is the one actually tracked in sharedNodeRefcount.
+	if src, ok := ev.subsetSource[expr]; ok {
+		return ev.shouldReleaseSharedNode(src)
+	}
 	if len(ev.sharedNodeRefcount) == 0 {
 		return true
 	}
@@ -2227,6 +2337,64 @@ func (ev *evaluator) evalSeries(ctx context.Context, series []storage.Series, of
 	return mat
 }
 
+// evalSubsetSelector derives e's result by evaluating src (e's subset
+// source, per ev.subsetSource — see docs/query-planner-phase4-design.md §1)
+// and filtering its Matrix down to the series matching e's own
+// LabelMatchers, instead of expanding e's own UnexpandedSeriesSet.
+//
+// This is correct without redoing any of evalSeries' per-sample work
+// (offset shifting, histogram-bucket skipping) because
+// SubsetSelectorElimination only ever relates two selectors sharing the
+// same Name/Offset/Timestamp/SkipHistogramBuckets (see subsumes' doc in
+// promql/plan/sse.go): src's Matrix has already had every transformation e
+// itself would have applied, so filtering it by label match is the only
+// remaining step. Checking e's full LabelMatchers (not just the residual
+// ones src lacks) is deliberately simpler than computing a residual set:
+// src's own matchers are already guaranteed to hold for every series in its
+// result, so re-checking them is redundant but harmless.
+//
+// The returned Matrix's Series share src's underlying FPoint/HPoint backing
+// arrays (see cloneSharedValue's doc: eval's memoization already clones the
+// outer []Series slice per consumer, so this filtering never mutates a
+// slice another consumer of src still needs) — no chunk decode happens here
+// beyond what src's own evaluation already did, which is the whole point of
+// this pass (see docs/query-planner-phase4-design.md §3).
+//
+// ev.eval(ctx, src), not ev.evalUncached, is deliberate: src may itself have
+// its own subsetSource (a subsumption chain), or be a genuine CSE-shared
+// node, and eval's memoization is what makes either case correct and
+// computed only once — see ev.subsetSource's doc.
+func (ev *evaluator) evalSubsetSelector(ctx context.Context, e *parser.VectorSelector, src parser.Expr) (parser.Value, annotations.Annotations) {
+	val, ws := ev.eval(ctx, src)
+	mat, ok := val.(Matrix)
+	if !ok {
+		// plan.SubsetSelectorElimination only ever relates two
+		// VectorSelectorNodes, whose evalUncached case always returns a
+		// Matrix (directly, or via evalSeries/smoothSeries) — this should
+		// be unreachable. Panicking here is caught and swallowed by
+		// materializePlanOptimizations' recover, same as any other plan bug.
+		panic(fmt.Errorf("promql: evalSubsetSelector: expected Matrix from subset source, got %T", val))
+	}
+	filtered := make(Matrix, 0, len(mat))
+	for _, series := range mat {
+		if matchesAllMatchers(series.Metric, e.LabelMatchers) {
+			filtered = append(filtered, series)
+		}
+	}
+	return filtered, ws
+}
+
+// matchesAllMatchers reports whether lbls satisfies every matcher in
+// matchers.
+func matchesAllMatchers(lbls labels.Labels, matchers []*labels.Matcher) bool {
+	for _, m := range matchers {
+		if !m.Matches(lbls.Get(m.Name)) {
+			return false
+		}
+	}
+	return true
+}
+
 // numSteps returns the number of steps in the evaluator's range,
 // treating an instant query (interval == 0) as a single step.
 func (ev *evaluator) numSteps() int {
@@ -2892,6 +3060,9 @@ func (ev *evaluator) evalUncached(ctx context.Context, expr parser.Expr) (parser
 		return String{V: e.Val, T: ev.startTimestamp}, nil
 
 	case *parser.VectorSelector:
+		if src, ok := ev.subsetSource[e]; ok {
+			return ev.evalSubsetSelector(ctx, e, src)
+		}
 		ws, err := checkAndExpandSeriesSet(ctx, e)
 		if err != nil {
 			ev.error(errWithWarnings{fmt.Errorf("expanding series: %w", err), ws})

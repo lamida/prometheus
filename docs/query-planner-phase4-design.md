@@ -298,3 +298,99 @@ capturing even if a ratio signal existed.
    applies (never share across a subquery/step-invariant boundary), and if
    so, is that guard identical to CSE's existing one or does it need its
    own?
+
+## §7: built anyway, opt-in, always-share
+
+The recommendation above stands as the analysis: this pass has no reliable
+gate today. The project chose to build it anyway, behind
+`EngineOpts.EnableSubsetSelectorElimination` (default `false`, mirroring
+`EnableCommonSubexpressionElimination`'s own opt-in precedent), accepting
+the regression risk documented in §6's results as the cost of enabling it.
+This section records what shipped and resolves the four open questions
+above with the choices actually made, so a future reader does not have to
+reconstruct them from the diff.
+
+**What shipped**, in `promql/plan/sse.go`, `promql/plan/materialize.go`, and
+`promql/engine.go`:
+
+- `SubsetSelectorElimination` detects the relation exactly as §1 defines
+  it — same `Name`/`Offset`/`Timestamp`/`SkipHistogramBuckets`, one
+  selector's `LabelMatchers` a strict superset of another's — and, per
+  selector, picks the eligible candidate with the *fewest* matchers as its
+  source (§2's "cheapest already-materialized superset"), ties broken
+  deterministically. It runs after `CommonSubexpressionElimination` on the
+  same plan, as §2 specifies.
+- `MaterializeSubsetSharing` differs from CSE's own `MaterializeSharing` in
+  one deliberate way: it never aliases pointers in the real
+  `parser.Expr` tree. B's occurrence keeps its own object; the returned
+  `map[parser.Expr]parser.Expr` (subsumed selector → source selector) is
+  consumed directly by the evaluator instead. Pointer-aliasing, CSE's own
+  mechanism, only works when both occurrences want an *identical* result
+  (§3's own point) — it cannot express "derive a filtered subset of."
+- Execution reuses CSE's existing `sharedNodeRefcount`/`sharedResults`/
+  `cloneSharedValue` machinery rather than introducing a parallel cache: a
+  selector serving as another's subset source gets its refcount bumped by
+  one per dependent (in addition to its own natural occurrence, or
+  whatever real CSE duplication already gave it). `evalUncached`'s
+  `*parser.VectorSelector` case, when a subset-source mapping exists,
+  calls `ev.eval` on the source (memoized, so a source with more than one
+  dependent is still computed once) and filters the resulting `Matrix` by
+  the dependent's own `LabelMatchers` — checking the full list, not just
+  the residual matchers the source lacks, since re-checking an
+  already-guaranteed-true matcher is redundant but harmless and avoids
+  computing a residual set at all. No `FilteredSelectorNode` was added to
+  `promql/plan`: the relation is tracked as a field
+  (`VectorSelectorNode.subsetSource`) on the existing node type instead,
+  since the execution side never needed a new plan-graph shape, only a
+  new side-table the evaluator consults.
+- `populateSeries` is untouched: a subsumed selector's own
+  `storage.Querier.Select` call still happens (exactly as CSE also leaves
+  a merged selector's *first* `Select` call in place today). This is safe
+  to leave as-is because `Select` returns a lazy `storage.SeriesSet`: the
+  actual index walk and chunk decode only happen once something iterates
+  it, and a subsumed selector's `UnexpandedSeriesSet`/`Series` fields are
+  simply never consulted once `evalUncached` redirects it to its source —
+  so the real cost §6's benchmark measured is still avoided, without
+  needing to touch `populateSeries` at all.
+
+**Open Question 1** (does this overlap with `PropagateMatchers` close most
+of the gap): left open. Nothing in this implementation measures real-world
+selector-pair frequency; that remains future work if this pass's actual
+production impact needs justifying later.
+
+**Open Question 2** (predicting the ratio from selector shape): left open,
+as expected — no cardinality estimate was added. This is the
+"always-share" choice from this section's title: the implementation does
+not attempt to gate on `Name` equality or any other proxy, so it will
+regress queries below the ~0.12-0.21 crossover ratio §6 measured, exactly
+as documented. This is a known, accepted cost of enabling the flag, not an
+oversight.
+
+**Open Question 3** (`MatrixSelectorNode`/range selectors): resolved
+narrow, as CSE itself started. A `VectorSelectorNode` reachable only as a
+`MatrixSelectorNode`'s child is excluded from candidacy entirely (neither
+source nor dependent): `promql/engine.go`'s only execution hook is
+`evalUncached`'s `*parser.VectorSelector` case, which a
+`MatrixSelectorNode`'s child is never evaluated through (`matrixSelector`
+reads `e.VectorSelector.Series` directly instead). A relation spanning a
+matrix-nested selector would simply never fire, while still inflating a
+source's expected-consumer count — excluding it is simpler than tracking
+per-occurrence eligibility for this case. Extending to range selectors, if
+ever wanted, is future work, not part of this change.
+
+**Open Question 4** (same `hasUnstableOffset` conservatism as CSE):
+resolved yes — identical guard, not a new one. `subsumes` refuses to
+relate two selectors if either has `hasUnstableOffset` set, for the exact
+reason CSE's own `EquivalentTo` does (see `hasUnstableOffset`'s doc in
+`promql/plan/nodes.go`): the same `setOffsetForAtModifier` hazard applies
+regardless of which relation (equality or subsumption) would otherwise
+expose a query to it.
+
+**One gap inherited from CSE, not introduced by this work**: neither
+`plan.FromExpr` nor `CommonSubexpressionElimination`'s `EquivalentTo`
+capture `parser.VectorSelector`'s `Smoothed`/`Anchored` fields today, so
+CSE can already (in principle) merge two selectors differing only in one
+of those flags. `SubsetSelectorElimination` inherits the same gap rather
+than fixing it, since fixing it is a pre-existing CSE concern out of scope
+for this pass to take on alone — SSE is no less safe than CSE already is
+here, not more.
