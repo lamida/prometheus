@@ -394,3 +394,81 @@ of those flags. `SubsetSelectorElimination` inherits the same gap rather
 than fixing it, since fixing it is a pre-existing CSE concern out of scope
 for this pass to take on alone — SSE is no less safe than CSE already is
 here, not more.
+
+## §8: real-engine benchmark, run
+
+`promql/engine_sse_bench_test.go` (`BenchmarkSubsetSelectorElimination`)
+is the real-engine counterpart to §6's prototype, requested by
+`docs/query-planner-phase5-productionization.md` item 5: instead of
+operating directly on a `storage.Querier`, it builds a real `*promql.Engine`
+with `EnableSubsetSelectorElimination` true/false and runs an actual
+instant query, `sum(A) + sum(B)`, where A = `{__name__="sse_bench_test",
+job="x"}` and B = A plus one residual matcher — the same subsumption
+relation, cardinalities (100/1,000/10,000), and ratios (0.50/0.10/0.01) as
+§6, reused across ratios via the same
+`half`/`decile`/`percentile`-labeled fixture.
+
+Measured on this machine (Apple M4 Pro, `-benchtime=1s -count=6`,
+`benchstat` comparing `sse_disabled` against `sse_enabled`; absolute
+numbers will vary by hardware):
+
+| \|A\| | ratio | time (sse\_disabled → sse\_enabled) | time delta | alloc delta |
+|---|---|---|---|---|
+| 100    | 0.50 | 261.2µs → 185.5µs | −28.95% (p=0.002) | +7.95% B/op |
+| 100    | 0.10 | 196.8µs → 184.2µs |  −6.44% (p=0.002) | +33.99% B/op |
+| 100    | 0.01 | 180.5µs → 184.6µs |  +2.30% (p=0.002) | +42.12% B/op |
+| 1,000  | 0.50 | 2.533ms → 1.730ms | −31.71% (p=0.002) | +3.82% B/op |
+| 1,000  | 0.10 | 1.871ms → 1.724ms |  −7.86% (p=0.002) | +34.95% B/op |
+| 1,000  | 0.01 | 1.715ms → 1.730ms |   ~0.9% (p=0.065, not significant) | +45.63% B/op |
+| 10,000 | 0.50 | 26.07ms → 17.70ms | −32.10% (p=0.002) | +2.67% B/op |
+| 10,000 | 0.10 | 19.18ms → 17.33ms |  −9.65% (p=0.002) | +32.88% B/op |
+| 10,000 | 0.01 | 17.29ms → 17.72ms |  +2.49% (p=0.004) | +42.67% B/op |
+
+This does **not** reproduce §6's ~0.12-0.21 crossover ratio on the time
+axis, and the reason is a real difference between the prototype's
+comparison and what the real engine actually does, not a case of the
+prototype simply being wrong:
+
+1. **§6's prototype measured `Select(A)` and `Select(B)` in isolation —
+   nothing else ever needed A's own decoded result.** This benchmark's
+   query, `sum(A) + sum(B)`, is the shape SSE actually requires: the
+   subsumption relation is only detected between two selectors that are
+   *both already present as literal nodes in the query* (§1), so A's own
+   value is always consumed by the query regardless of whether SSE is
+   enabled. A's selection and decode cost is therefore sunk in both the
+   `sse_disabled` and `sse_enabled` case; the only cost SSE actually
+   removes is B's *independent* selection and decode. That cost was never
+   free to begin with, so removing it is closer to a pure win than §6's
+   isolated comparison suggested — down to the lowest ratio tested
+   (0.01), the time cost is flat to a barely-significant few-percent
+   regression, never the 8-18% one would extrapolate from §6's numbers at
+   this ratio.
+2. **The allocation numbers tell a different, more consistent story, and
+   match §6's underlying mechanism much more closely.** `sse_enabled`'s
+   `B/op` overhead grows monotonically as ratio shrinks (roughly 3-8% at
+   ratio 0.5, up to 33-46% at ratio 0.01, at every cardinality tested).
+   This is exactly §6's finding 1 (`shared_prototype`'s cost is nearly
+   flat in absolute terms regardless of ratio, because it is dominated by
+   fully materializing A) showing up as a *relative* memory cost instead
+   of a *relative* time cost: deriving a tiny B by filtering all of A
+   allocates roughly the same amount of memory to do it no matter how
+   small B turns out to be, so the smaller B is, the more wasteful that
+   fixed cost looks by comparison. Time is largely unaffected because
+   A's decode was already unavoidable, but the GC pressure is real and
+   scales the same way §6 predicted.
+
+**Conclusion for the risk documented in this file and repeated in
+`docs/feature_flags.md`/`cmd/prometheus/main.go`'s `--enable-feature`
+wiring**: the ~0.12-0.21 crossover *ratio* does not manifest as a query
+*latency* regression in the one query shape SSE can actually fire for
+(source and dependent both consumed by the same query), because that
+shape always pays the source's decode cost regardless of the flag — this
+narrows the practical risk from §6/§7's framing. It does still manifest as
+a real, ratio-dependent *memory allocation* cost, which is a real (if
+different) concern for GC-sensitive deployments running high-cardinality
+low-ratio queries repeatedly. The feature flag's warning should be read as
+"expect more allocation at low subset ratios, not necessarily slower
+queries in the shape this pass targets" rather than a blanket "may be
+slower" — a more precise, less alarming framing than §6/§7 could
+support before this benchmark existed, but not a clean bill of health
+either.

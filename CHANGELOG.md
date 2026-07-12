@@ -1,5 +1,10 @@
 # Changelog
 
+## unreleased
+
+- [FEATURE] PromQL: Add experimental `promql-common-subexpression-elimination` feature flag: evaluates identical subexpressions repeated within a query only once, sharing the result across every occurrence.
+- [FEATURE] PromQL: Add experimental `promql-subset-selector-elimination` feature flag: derives a vector selector's result from another selector in the same query whose matchers are a superset of its own, instead of re-selecting from storage. Unlike other PromQL feature flags, this is not a strict improvement: it increases memory allocation for low-cardinality-ratio subset selectors; see `docs/feature_flags.md` for details.
+
 ## 3.13.0 / 2026-07-01
 
 - [SECURITY] UI: Bump `sanitize-html` to fix a cross-site scripting vulnerability (CVE-2026-44990). #18697
