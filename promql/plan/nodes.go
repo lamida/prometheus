@@ -61,10 +61,28 @@ type VectorSelectorNode struct {
 	// genuinely uncertain, and the decision is to never share these nodes
 	// rather than try to resolve the uncertainty now.
 	hasUnstableOffset bool
+
+	// subsetSource, if non-nil, is another VectorSelectorNode this node's
+	// LabelMatchers are a strict matcher-superset of (see
+	// docs/query-planner-phase4-design.md §1): every point in time, this
+	// node's result set is guaranteed to be a subset of subsetSource's.
+	// Set by SubsetSelectorElimination (sse.go), which must run after
+	// CommonSubexpressionElimination on the same root (§2). A nil value is
+	// the overwhelming common case: most selectors have no cheaper
+	// already-materialized superset available.
+	subsetSource *VectorSelectorNode
 }
 
 // ChildCount always returns 0: a vector selector is a leaf node.
 func (n *VectorSelectorNode) ChildCount() int { return 0 }
+
+// SubsetSource returns the VectorSelectorNode n's LabelMatchers are a strict
+// matcher-superset of, or nil if SubsetSelectorElimination found none.
+// Exported primarily so tests outside this package can assert on this fact
+// directly.
+func (n *VectorSelectorNode) SubsetSource() *VectorSelectorNode {
+	return n.subsetSource
+}
 
 // EquivalentTo reports whether other is a VectorSelectorNode selecting the
 // same name, matchers, offset, timestamp, and histogram-bucket-skipping

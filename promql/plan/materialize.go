@@ -147,6 +147,73 @@ func MaterializeSharing(root Node) map[parser.Expr]int {
 	return refcounts
 }
 
+// MaterializeSubsetSharing walks root's plan graph (which must already have
+// had SubsetSelectorElimination run over it — see sse.go) and, for every
+// VectorSelectorNode with a subsetSource set, returns a mapping from that
+// node's canonical real parser.Expr to its source's canonical real
+// parser.Expr, provided both have at least one occurrence eligible for
+// sharing (see occurrenceRecord.ineligibleForSharing's doc — the same
+// subquery/step-invariant conservatism CSE's own MaterializeSharing
+// applies).
+//
+// Unlike MaterializeSharing, this never aliases pointers in the real
+// parser.Expr tree: B's occurrence keeps its own object, since B's result is
+// a filtered subset of A's, never identical to it (see
+// docs/query-planner-phase4-design.md §3). The returned map is instead
+// consumed directly by promql/engine.go's evaluator to redirect B's
+// evaluation to "derive from A's result" at eval time.
+//
+// A node with no eligible occurrence of its own, or whose subsetSource has
+// none, is simply omitted from the result: nothing is materialized for it,
+// matching MaterializeSharing's own omission behavior for the same reason.
+func MaterializeSubsetSharing(root Node) map[parser.Expr]parser.Expr {
+	result := make(map[parser.Expr]parser.Expr)
+	visited := make(map[Node]bool)
+	materializeSubsetWalk(root, visited, result)
+	return result
+}
+
+func materializeSubsetWalk(n Node, visited map[Node]bool, result map[parser.Expr]parser.Expr) {
+	if n == nil || visited[n] {
+		return
+	}
+	visited[n] = true
+
+	for i := 0; i < n.ChildCount(); i++ {
+		materializeSubsetWalk(n.Child(i), visited, result)
+	}
+
+	vs, ok := n.(*VectorSelectorNode)
+	if !ok || vs.subsetSource == nil {
+		return
+	}
+	bExpr, ok := firstEligibleOccurrence(vs)
+	if !ok {
+		return
+	}
+	aExpr, ok := firstEligibleOccurrence(vs.subsetSource)
+	if !ok {
+		return
+	}
+	result[bExpr] = aExpr
+}
+
+// firstEligibleOccurrence returns the realExpr of n's first occurrence
+// record not marked ineligibleForSharing, or false if n has none (n is
+// entirely nested under a subquery/step-invariant boundary).
+func firstEligibleOccurrence(n Node) (parser.Expr, bool) {
+	holder, ok := n.(occurrenceHolder)
+	if !ok {
+		return nil, false
+	}
+	for _, o := range holder.occurrenceRecords() {
+		if !o.ineligibleForSharing {
+			return o.realExpr, true
+		}
+	}
+	return nil, false
+}
+
 // materializeWalk visits every node reachable from n exactly once (guarded
 // by visited, since a node with ParentCount() > 1 is reachable via more
 // than one path), materializing each node's occurrence sharing as it goes.
