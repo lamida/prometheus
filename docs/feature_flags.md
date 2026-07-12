@@ -392,3 +392,42 @@ to this maximum, so an operator setting a smaller cap does not break
 no-`limit` requests. Setting the flag to `0` disables the cap entirely; this
 is **not recommended** for endpoints exposed beyond a trusted network because a
 single client can then request the entire index in one response.
+
+## PromQL common subexpression elimination
+
+`--enable-feature=promql-common-subexpression-elimination`
+
+When enabled, the PromQL engine detects identical subexpressions that occur
+more than once in a query (for example, the same vector selector or the same
+function call reused across two arms of a binary operation) and evaluates
+each one only once, sharing the result across every occurrence instead of
+recomputing it.
+
+This is a pure performance optimization: it does not change query results.
+Queries that do not contain a repeated subexpression are unaffected.
+
+## PromQL subset selector elimination
+
+`--enable-feature=promql-subset-selector-elimination`
+
+When enabled, the PromQL engine detects vector selectors whose label matchers
+are a superset of another selector's matchers in the same query (for example,
+`up` and `up{job="a"}` both present), and evaluates only the broader
+selector, deriving the narrower selector's result by filtering the broader
+selector's series instead of re-selecting from storage.
+
+> **Warning**: unlike common subexpression elimination, this is not a strict
+> improvement. This only activates when the broader (source) selector is
+> already present elsewhere in the same query, so its own selection cost is
+> paid either way; real-engine benchmarks did not find this to regress
+> query *latency* in that shape, even at a low (0.01) subset-to-source
+> cardinality ratio. It does increase *memory allocation*, roughly in
+> proportion to how small the subset is relative to its source (up to
+> ~30-45% more allocated per query in benchmarks, at a subset ratio of
+> 0.10-0.01), since deriving a small subset still requires materializing
+> the entire source selector's result. See
+> [`query-planner-phase4-design.md`](query-planner-phase4-design.md) §6-§8
+> for the full analysis. Only enable this flag if your deployment can
+> tolerate that extra allocation/GC pressure for queries with low subset
+> ratios, or you have measured that the tradeoff is acceptable for your
+> workload.
